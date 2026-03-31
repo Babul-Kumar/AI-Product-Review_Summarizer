@@ -140,19 +140,14 @@ class AnalyzeResponse(BaseModel):
     confidence: float
 
 
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://ai-product-review-5juxqv2ww-bk7321634-3614s-projects.vercel.app",
-]
-
 app = FastAPI(title="AI Product Review Aggregator API")
 
+# Allow all origins to support dynamic frontend deployments (e.g., Vercel)
+# Fixes CORS preflight (OPTIONS) request failures
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https://ai-product-review(?:-[a-z0-9-]+)?\.vercel\.app$",
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
