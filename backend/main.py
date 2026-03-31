@@ -26,7 +26,7 @@ LEGACY_MODEL_ALIASES = {
 }
 MAX_POINTS = 6
 MAX_REVIEWS = 100
-NEUTRAL_POLARITY_THRESHOLD = 0.15
+SENTIMENT_POLARITY_THRESHOLD = 0.1
 NEUTRAL_CUES = (
     "okay",
     "ok",
@@ -66,6 +66,33 @@ NEGATIVE_CUES = (
     "terrible",
     "bad",
 )
+STRONG_NEGATIVE_KEYWORDS = (
+    "not",
+    "bad",
+    "poor",
+    "worst",
+    "waste",
+    "slow",
+    "issue",
+    "problem",
+    "crash",
+)
+COMPARISON_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "the",
+    "to",
+    "very",
+    "with",
+}
 GENERIC_POINT_MARKERS = (
     "no major",
     "no clear",
@@ -130,49 +157,20 @@ app.add_middleware(
 def classify_sentiment(text: str) -> tuple[str, float]:
     polarity = TextBlob(text).sentiment.polarity
     lowered_text = text.lower()
-    has_positive_cue = any(cue in lowered_text for cue in POSITIVE_CUES)
-    has_negative_cue = any(cue in lowered_text for cue in NEGATIVE_CUES)
-    has_neutral_cue = any(cue in lowered_text for cue in NEUTRAL_CUES)
 
-    clauses = split_sentences(text)
-    if len(clauses) > 1:
-        clause_labels: list[str] = []
-        for clause in clauses:
-            clause_polarity = TextBlob(clause).sentiment.polarity
-            clause_lowered = clause.lower()
-            clause_has_positive = any(cue in clause_lowered for cue in POSITIVE_CUES)
-            clause_has_negative = any(cue in clause_lowered for cue in NEGATIVE_CUES)
-            clause_has_neutral = any(cue in clause_lowered for cue in NEUTRAL_CUES)
-
-            if clause_has_positive and not clause_has_negative and clause_polarity > -0.1:
-                clause_labels.append("positive")
-            elif clause_has_negative and clause_polarity < 0.1:
-                clause_labels.append("negative")
-            elif clause_has_neutral or abs(clause_polarity) <= NEUTRAL_POLARITY_THRESHOLD:
-                clause_labels.append("neutral")
-
-        if "positive" in clause_labels and "negative" in clause_labels:
-            return "neutral", polarity
-
-    if has_neutral_cue and abs(polarity) < 0.5:
-        return "neutral", polarity
-
-    if has_negative_cue and has_positive_cue and abs(polarity) <= 0.2:
-        return "neutral", polarity
-
-    if has_negative_cue and polarity < 0:
+    if any(
+        re.search(rf"\b{re.escape(keyword)}\b", lowered_text)
+        for keyword in STRONG_NEGATIVE_KEYWORDS
+    ):
         return "negative", polarity
 
-    if has_positive_cue and polarity > -0.1:
+    if polarity > SENTIMENT_POLARITY_THRESHOLD:
         return "positive", polarity
 
-    if abs(polarity) <= NEUTRAL_POLARITY_THRESHOLD:
-        return "neutral", polarity
+    if polarity < -SENTIMENT_POLARITY_THRESHOLD:
+        return "negative", polarity
 
-    if polarity > 0:
-        return "positive", polarity
-
-    return "negative", polarity
+    return "neutral", polarity
 
 
 def calculate_sentiment(reviews: list[str]) -> dict[str, int | float]:
@@ -280,9 +278,9 @@ def normalize_display_text(text: str) -> str:
 def point_signature(text: str) -> str:
     normalized_text = normalize_point(text).lower().strip()
     normalized_text = re.sub(r"[^a-z0-9 ]", "", normalized_text)
-    stop_words = {"a", "an", "and", "the", "is", "very", "with"}
-    tokens = [token for token in normalized_text.split() if token not in stop_words]
-    return " ".join(tokens[:6])
+    normalized_text = re.sub(r"\s+", " ", normalized_text).strip()
+    tokens = [token for token in normalized_text.split() if token not in COMPARISON_STOP_WORDS]
+    return " ".join(tokens)
 
 
 def point_signature_tokens(text: str) -> list[str]:
@@ -290,6 +288,24 @@ def point_signature_tokens(text: str) -> list[str]:
 
 
 def points_overlap(existing: str, candidate: str) -> bool:
+    normalized_existing = normalize_point(existing).lower()
+    normalized_candidate = normalize_point(candidate).lower()
+
+    if not normalized_existing or not normalized_candidate:
+        return False
+
+    if (
+        normalized_existing.startswith(GENERIC_POINT_MARKERS)
+        or normalized_candidate.startswith(GENERIC_POINT_MARKERS)
+    ):
+        return normalized_existing == normalized_candidate
+
+    if normalized_existing == normalized_candidate:
+        return True
+
+    if normalized_existing in normalized_candidate or normalized_candidate in normalized_existing:
+        return True
+
     existing_tokens = point_signature_tokens(existing)
     candidate_tokens = point_signature_tokens(candidate)
     if len(existing_tokens) < 2 or len(candidate_tokens) < 2:
@@ -301,33 +317,30 @@ def points_overlap(existing: str, candidate: str) -> bool:
         return True
 
     overlap_count = len(existing_set & candidate_set)
-    return overlap_count >= min(len(existing_set), len(candidate_set))
+    smaller_set_size = min(len(existing_set), len(candidate_set))
+    return overlap_count >= 2 and (overlap_count / smaller_set_size) >= 0.75
+
+
+def should_replace_point(existing: str, candidate: str) -> bool:
+    existing_score = (len(point_signature_tokens(existing)), len(existing))
+    candidate_score = (len(point_signature_tokens(candidate)), len(candidate))
+    return candidate_score > existing_score
 
 
 def deduplicate_semantic(points: list[str]) -> list[str]:
     result: list[str] = []
 
-    for point in list(dict.fromkeys(points)):
+    for point in points:
         candidate = normalize_point(point)
-        candidate_key = point_signature(candidate)
-        if not candidate_key:
+        if not candidate:
             continue
 
-        redundant_index: int | None = None
         should_skip = False
 
         for index, existing in enumerate(result):
-            existing_key = point_signature(existing)
-
-            if candidate_key == existing_key:
-                should_skip = True
-                break
-
             if points_overlap(existing, candidate):
-                existing_tokens = point_signature_tokens(existing)
-                candidate_tokens = point_signature_tokens(candidate)
-                if len(candidate_tokens) > len(existing_tokens):
-                    redundant_index = index
+                if should_replace_point(existing, candidate):
+                    result[index] = candidate
                 else:
                     should_skip = True
                 break
@@ -335,9 +348,7 @@ def deduplicate_semantic(points: list[str]) -> list[str]:
         if should_skip:
             continue
 
-        if redundant_index is not None:
-            result[redundant_index] = candidate
-        else:
+        if not any(points_overlap(existing, candidate) for existing in result):
             result.append(candidate)
 
     return result
@@ -393,8 +404,14 @@ def clean_optional_point_list(items: list[str]) -> list[str]:
 
 
 def exclude_existing_points(items: list[str], excluded_items: list[str]) -> list[str]:
-    excluded_keys = {point_signature(item) for item in excluded_items if item}
-    return [item for item in items if point_signature(item) not in excluded_keys]
+    filtered_items: list[str] = []
+
+    for item in items:
+        if any(points_overlap(item, excluded_item) for excluded_item in excluded_items if excluded_item):
+            continue
+        filtered_items.append(item)
+
+    return filtered_items
 
 
 def extract_points(

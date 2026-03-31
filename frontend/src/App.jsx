@@ -12,6 +12,7 @@ const EMPTY_RESULT = {
     positive: 0,
     neutral: 0,
     negative: 0,
+    total: 0,
   },
   score: 0,
   confidence: 0,
@@ -46,6 +47,7 @@ function normalizeResult(data) {
       positive: toSafeNumber(sentiment.positive),
       neutral: toSafeNumber(sentiment.neutral),
       negative: toSafeNumber(sentiment.negative),
+      total: toSafeNumber(sentiment.total),
     },
     score: toSafeNumber(data?.score),
     confidence: toSafeNumber(data?.confidence),
@@ -223,7 +225,7 @@ function App() {
                   <button
                     type="submit"
                     disabled={loading || reviews.length === 0}
-                    className="inline-flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-amber-300 px-6 py-3 text-sm font-semibold text-slate-950 shadow-[0_14px_40px_rgba(52,211,153,0.28)] transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-70"
+                    className="inline-flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-amber-300 px-6 py-3 text-sm font-semibold text-slate-950 shadow-[0_14px_40px_rgba(52,211,153,0.28)] transition duration-300 hover:-translate-y-0.5 hover:scale-105 disabled:cursor-not-allowed disabled:opacity-70"
                   >
                     {loading ? "Analyzing..." : "Analyze Reviews"}
                   </button>
@@ -280,6 +282,12 @@ function App() {
 
               <div className="flex flex-wrap gap-3">
                 <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
+                  <span className="block text-slate-400">Total Reviews</span>
+                  <span className="font-semibold text-slate-100">
+                    {safeResult.sentiment.total || reviews.length}
+                  </span>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
                   <span className="block text-slate-400">Score</span>
                   <span className="font-semibold text-amber-100">{formatScore(safeResult.score)}</span>
                 </div>
@@ -333,7 +341,7 @@ function App() {
                   <p className="text-sm uppercase tracking-[0.18em] text-amber-100">
                     Neutral Points
                   </p>
-                  {renderList(safeResult.neutral_points, "No neutral points returned.")}
+                  {renderList(safeResult.neutral_points, "No neutral feedback found.")}
                 </article>
               </div>
 
@@ -352,6 +360,10 @@ function App() {
             </div>
           </section>
         ) : null}
+
+        <footer className="mt-10 text-center text-sm text-slate-400/80">
+          Developed by Babul Kumar
+        </footer>
       </div>
     </main>
   );
