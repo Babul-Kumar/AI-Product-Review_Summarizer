@@ -1,0 +1,7 @@
+# This project uses the current Google Gen AI SDK instead of the older
+# google-generativeai / gemini-pro flow so it stays runnable on modern Gemini docs.
+fastapi
+uvicorn[standard]
+textblob
+python-dotenv
+google-genai
