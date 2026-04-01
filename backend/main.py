@@ -76,6 +76,18 @@ STRONG_NEGATIVE_KEYWORDS = (
     "issue",
     "problem",
     "crash",
+    "bug",
+    "buggy",
+    "overheat",
+    "overheating",
+    "lag",
+    "lagging",
+    "drain",
+    "drains",
+    "heats",
+    "heating",
+    "fails",
+    "failure",
 )
 COMPARISON_STOP_WORDS = {
     "a",
@@ -99,6 +111,46 @@ GENERIC_POINT_MARKERS = (
     "none",
     "not mentioned",
     "n/a",
+)
+PRODUCT_KEYWORDS = (
+    "battery",
+    "camera",
+    "performance",
+    "design",
+    "quality",
+    "price",
+    "screen",
+    "display",
+    "speaker",
+    "software",
+    "support",
+    "charging",
+    "build",
+    "setup",
+)
+SENTIMENT_WORDS = (
+    "good",
+    "bad",
+    "poor",
+    "excellent",
+    "slow",
+    "fast",
+    "great",
+    "amazing",
+    "terrible",
+    "buggy",
+    "average",
+)
+QUESTION_PREFIXES = (
+    "who",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "tell me",
+    "explain",
+    "define",
 )
 
 
@@ -153,14 +205,43 @@ app.add_middleware(
 )
 
 
+# Health check endpoint for monitoring tools (UptimeRobot, etc.)
+# Returns simple status to verify server is alive
+@app.get("/ping")
+def ping() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {
+        "status": "healthy",
+        "service": "AI Product Review API",
+    }
+
+
+def is_review_related(text: str) -> bool:
+    text_lower = text.lower().strip()
+    if not text_lower:
+        return False
+
+    if text_lower.startswith(QUESTION_PREFIXES):
+        return False
+
+    if any(word in text_lower for word in PRODUCT_KEYWORDS + SENTIMENT_WORDS):
+        return True
+
+    if len(text_lower) > 15 and len(text_lower.split()) >= 3:
+        return True
+
+    return False
+
+
 def classify_sentiment(text: str) -> tuple[str, float]:
     polarity = TextBlob(text).sentiment.polarity
     lowered_text = text.lower()
 
-    if any(
-        re.search(rf"\b{re.escape(keyword)}\b", lowered_text)
-        for keyword in STRONG_NEGATIVE_KEYWORDS
-    ):
+    if any(keyword in lowered_text for keyword in STRONG_NEGATIVE_KEYWORDS):
         return "negative", polarity
 
     if polarity > SENTIMENT_POLARITY_THRESHOLD:
@@ -317,7 +398,7 @@ def points_overlap(existing: str, candidate: str) -> bool:
 
     overlap_count = len(existing_set & candidate_set)
     smaller_set_size = min(len(existing_set), len(candidate_set))
-    return overlap_count >= 2 and (overlap_count / smaller_set_size) >= 0.75
+    return overlap_count >= 2 and (overlap_count / smaller_set_size) >= 0.6
 
 
 def should_replace_point(existing: str, candidate: str) -> bool:
@@ -402,6 +483,14 @@ def clean_optional_point_list(items: list[str]) -> list[str]:
     return cleaned_points[:MAX_POINTS]
 
 
+def filter_generic_neutral_points(points: list[str]) -> list[str]:
+    return [
+        point
+        for point in points
+        if "overall" not in point.lower() and "mixed" not in point.lower()
+    ]
+
+
 def exclude_existing_points(items: list[str], excluded_items: list[str]) -> list[str]:
     filtered_items: list[str] = []
 
@@ -428,6 +517,9 @@ def extract_points(
                 continue
 
             sentiment_label, _ = classify_sentiment(cleaned_sentence)
+            if target_label == "neutral" and sentiment_label != "neutral":
+                continue
+
             point_key = cleaned_sentence.lower()
             cue_match = False
             if target_label == "negative":
@@ -490,6 +582,7 @@ def build_fallback_analysis(reviews: list[str], sentiment: dict[str, int | float
         )
     )
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
+    neutral_points = filter_generic_neutral_points(neutral_points)
 
     summary = (
         f"Overall feedback is {tone}. "
@@ -530,6 +623,7 @@ def normalize_analysis(ai_analysis: AIAnalysis) -> AIAnalysis:
     )
     neutral_points = clean_optional_point_list(ai_analysis.neutral_points)
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
+    neutral_points = filter_generic_neutral_points(neutral_points)
 
     return AIAnalysis(
         summary=summary,
@@ -568,6 +662,7 @@ def merge_analysis_sources(primary: AIAnalysis, secondary: AIAnalysis) -> AIAnal
         merged_neutral_points,
     )
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
+    neutral_points = filter_generic_neutral_points(neutral_points)
 
     return AIAnalysis(
         summary=primary.summary.strip() or secondary.summary,
@@ -787,6 +882,10 @@ def read_root() -> dict[str, str]:
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_reviews(payload: ReviewRequest) -> AnalyzeResponse:
     try:
+        for review in payload.reviews:
+            if not is_review_related(review):
+                raise HTTPException(status_code=400, detail="Out of scope question is asked.")
+
         logger.info("Received /analyze request with %s reviews.", len(payload.reviews))
         sentiment = calculate_sentiment(payload.reviews)
         ai_analysis = get_ai_analysis(payload.reviews, sentiment)
