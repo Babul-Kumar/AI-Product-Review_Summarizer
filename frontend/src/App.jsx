@@ -2,6 +2,14 @@ import { useRef, useState } from "react";
 import SentimentChart from "./components/SentimentChart";
 
 const ANALYZE_URL = "https://ai-product-review.onrender.com/analyze";
+const MIN_REVIEW_INPUT_LENGTH = 10;
+const LOW_QUALITY_MESSAGE = "Please enter meaningful product reviews to get accurate insights.";
+const NON_MEANINGFUL_PATTERNS = [
+  /^no summary was returned\.?$/i,
+  /^no major recurring strengths were mentioned\.?$/i,
+  /^no major recurring complaints were mentioned\.?$/i,
+  /^no neutral feedback found\.?$/i,
+];
 
 const EMPTY_RESULT = {
   summary: "",
@@ -63,11 +71,22 @@ function formatScore(value) {
   return safeValue > 0 ? `${safeValue.toFixed(2)} / 5` : "Not available";
 }
 
+function isMeaningfulItem(item) {
+  const text = String(item ?? "").trim();
+
+  return text.length > 0 && !NON_MEANINGFUL_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function hasMeaningfulInsights(data) {
+  return data.pros.some(isMeaningfulItem) || data.cons.some(isMeaningfulItem);
+}
+
 function App() {
   const [inputText, setInputText] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [lowQualityMessage, setLowQualityMessage] = useState("");
 
   const inFlightRef = useRef(false);
   const lastRequestKeyRef = useRef("");
@@ -79,6 +98,10 @@ function App() {
     .filter(Boolean);
 
   const safeResult = result ?? EMPTY_RESULT;
+  const trimmedInput = inputText.trim();
+  const isInputTooShort = trimmedInput.length > 0 && trimmedInput.length < MIN_REVIEW_INPUT_LENGTH;
+  const hasMeaningfulResult = result ? hasMeaningfulInsights(result) : false;
+  const isAnalyzeDisabled = loading || reviews.length === 0 || trimmedInput.length < MIN_REVIEW_INPUT_LENGTH;
 
   const analyzeReviews = async () => {
     if (loading || inFlightRef.current) {
@@ -92,6 +115,14 @@ function App() {
 
     if (cleanedReviews.length === 0) {
       setError("Please enter at least one review before analyzing.");
+      setLowQualityMessage("");
+      setResult(null);
+      return;
+    }
+
+    if (trimmedInput.length < MIN_REVIEW_INPUT_LENGTH) {
+      setError("");
+      setLowQualityMessage(LOW_QUALITY_MESSAGE);
       setResult(null);
       return;
     }
@@ -100,12 +131,19 @@ function App() {
 
     if (requestKey === lastRequestKeyRef.current && lastResultRef.current) {
       setError("");
-      setResult(lastResultRef.current);
+      if (hasMeaningfulInsights(lastResultRef.current)) {
+        setLowQualityMessage("");
+        setResult(lastResultRef.current);
+      } else {
+        setResult(null);
+        setLowQualityMessage(LOW_QUALITY_MESSAGE);
+      }
       return;
     }
 
     setLoading(true);
     setError("");
+    setLowQualityMessage("");
     setResult(null);
     inFlightRef.current = true;
 
@@ -142,8 +180,16 @@ function App() {
       const normalizedData = normalizeResult(data);
       lastRequestKeyRef.current = requestKey;
       lastResultRef.current = normalizedData;
-      setResult(normalizedData);
+
+      if (hasMeaningfulInsights(normalizedData)) {
+        setLowQualityMessage("");
+        setResult(normalizedData);
+      } else {
+        setResult(null);
+        setLowQualityMessage(LOW_QUALITY_MESSAGE);
+      }
     } catch (requestError) {
+      setLowQualityMessage("");
       setError(
         requestError instanceof Error
           ? requestError.message
@@ -175,10 +221,16 @@ function App() {
   };
 
   return (
-    <main className="min-h-screen px-4 py-10 text-slate-100 sm:px-6 lg:px-8">
-      <div className="mx-auto flex max-w-6xl flex-col gap-8">
+    <main className="relative min-h-screen overflow-hidden px-4 py-10 text-slate-100 sm:px-6 lg:px-8">
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0">
+        <div className="absolute left-[12%] top-[-4rem] h-72 w-72 rounded-full bg-emerald-300/10 blur-3xl" />
+        <div className="absolute right-[-5rem] top-28 h-80 w-80 rounded-full bg-amber-200/8 blur-3xl" />
+        <div className="absolute bottom-12 left-1/2 h-64 w-64 -translate-x-1/2 rounded-full bg-teal-300/8 blur-3xl" />
+      </div>
+
+      <div className="relative mx-auto flex max-w-6xl flex-col gap-8">
         <section className="overflow-hidden rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.78)] shadow-[0_25px_120px_rgba(4,12,10,0.45)] backdrop-blur-xl">
-          <div className="grid gap-8 lg:grid-cols-[1.05fr_0.95fr]">
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1.1fr)_320px] lg:items-center">
             <div className="p-6 sm:p-8 lg:p-10">
               <div className="mb-6 inline-flex rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.22em] text-emerald-200">
                 React Frontend + FastAPI API
@@ -187,15 +239,15 @@ function App() {
               <h1 className="text-4xl font-bold tracking-tight text-white sm:text-5xl">
                 AI Product Review Analyzer
               </h1>
-              <p className="mt-4 max-w-2xl text-base leading-7 text-slate-300 sm:text-lg">
-                Paste one review per line, send them to the deployed FastAPI backend, and view the
-                summary, pros, cons, neutral points, sentiment breakdown, score, and confidence.
+              <p className="mt-3 max-w-2xl text-sm text-slate-300/80 sm:text-base">
+                Analyze product reviews to extract sentiment, pros, cons, and key insights
+                instantly.
               </p>
 
               <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
                 <label className="block">
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-3 text-sm font-medium text-slate-200">
-                    <span>Product Reviews</span>
+                    <span>Enter Reviews</span>
                     <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
                       {reviews.length} review{reviews.length === 1 ? "" : "s"}
                     </span>
@@ -208,23 +260,26 @@ function App() {
                       if (error) {
                         setError("");
                       }
+                      if (lowQualityMessage) {
+                        setLowQualityMessage("");
+                      }
                     }}
                     placeholder={`Battery life is excellent and setup was simple.\nThe camera is average for the price.\nPerformance feels slow sometimes.`}
                     className="min-h-64 w-full rounded-3xl border border-white/10 bg-slate-950/55 px-5 py-4 text-base text-slate-100 outline-none transition focus:border-emerald-300/60 focus:ring-2 focus:ring-emerald-300/20"
                   />
-                  <p className="mt-3 text-sm text-slate-400">
-                    Each line becomes one review in `inputText.split("\n")`.
+                  <p className="mt-3 text-xs text-slate-400">
+                    Enter 2-3 meaningful reviews for better insights
                   </p>
                 </label>
 
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="rounded-2xl border border-emerald-300/15 bg-emerald-300/8 px-4 py-3 text-sm text-emerald-100">
-                    API: {ANALYZE_URL}
+                  <div className="text-xs text-slate-500">
+                    Live API endpoint configured
                   </div>
 
                   <button
                     type="submit"
-                    disabled={loading || reviews.length === 0}
+                    disabled={isAnalyzeDisabled}
                     className="inline-flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-amber-300 px-6 py-3 text-sm font-semibold text-slate-950 shadow-[0_14px_40px_rgba(52,211,153,0.28)] transition duration-300 hover:-translate-y-0.5 hover:scale-105 disabled:cursor-not-allowed disabled:opacity-70"
                   >
                     {loading ? "Analyzing..." : "Analyze Reviews"}
@@ -232,32 +287,33 @@ function App() {
                 </div>
               </form>
 
+              {isInputTooShort && !error && !lowQualityMessage ? (
+                <div className="mt-5 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
+                  {LOW_QUALITY_MESSAGE}
+                </div>
+              ) : null}
+
               {error ? (
                 <div className="mt-5 rounded-2xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
                   {error}
                 </div>
               ) : null}
+
+              {lowQualityMessage ? (
+                <div className="mt-5 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
+                  {lowQualityMessage}
+                </div>
+              ) : null}
             </div>
 
-            <div className="border-l-0 border-white/10 bg-[linear-gradient(180deg,rgba(15,36,31,0.95),rgba(9,18,17,0.8))] p-6 sm:p-8 lg:border-l lg:p-10">
-              <div className="rounded-[1.75rem] border border-white/10 bg-white/5 p-5">
-                <p className="text-sm uppercase tracking-[0.22em] text-amber-200/80">
-                  What this shows
+            <div className="px-6 pb-6 sm:px-8 lg:px-0 lg:pr-10">
+              <div className="rounded-[1.75rem] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.03))] p-5 shadow-[0_18px_50px_rgba(4,12,10,0.22)]">
+                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-amber-100/75">
+                  Try Example
                 </p>
-                <ul className="mt-5 space-y-4 text-sm text-slate-200">
-                  <li className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3">
-                    Summary generated from all submitted reviews.
-                  </li>
-                  <li className="rounded-2xl border border-emerald-300/15 bg-emerald-300/8 px-4 py-3">
-                    Pros highlighted in a green card.
-                  </li>
-                  <li className="rounded-2xl border border-rose-300/15 bg-rose-300/8 px-4 py-3">
-                    Cons highlighted in a red card.
-                  </li>
-                  <li className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3">
-                    Sentiment percentages, score, confidence, and a live pie chart.
-                  </li>
-                </ul>
+                <div className="mt-4 rounded-2xl border border-emerald-300/12 bg-black/15 px-4 py-4 text-sm leading-7 text-slate-100">
+                  &quot;The camera is great but battery drains fast&quot;
+                </div>
               </div>
             </div>
           </div>
@@ -270,7 +326,7 @@ function App() {
           </section>
         ) : null}
 
-        {result ? (
+        {result && hasMeaningfulResult && !isInputTooShort && !lowQualityMessage ? (
           <section className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-6 shadow-[0_20px_90px_rgba(4,12,10,0.32)] backdrop-blur-xl sm:p-8">
             <div className="mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
