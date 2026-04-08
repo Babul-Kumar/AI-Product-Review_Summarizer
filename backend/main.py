@@ -26,6 +26,7 @@ LEGACY_MODEL_ALIASES = {
 }
 MAX_POINTS = 6
 MAX_REVIEWS = 100
+MAX_REVIEWS_TO_ANALYZE = 10
 SENTIMENT_POLARITY_THRESHOLD = 0.1
 NEUTRAL_CUES = (
     "okay",
@@ -277,22 +278,13 @@ def classify_sentiment(text: str) -> tuple[str, float]:
 
 
 def calculate_sentiment(ai_analysis: AIAnalysis) -> dict[str, int | float]:
-    # CHANGED: sentiment now comes from Gemini/fallback analysis output, not TextBlob polarity.
-    def count_real_points(points: list[str]) -> int:
-        return sum(
-            1
-            for point in points
-            if normalize_point(point)
-            and not normalize_point(point).lower().startswith(GENERIC_POINT_MARKERS)
-        )
-
-    positive_count = count_real_points(ai_analysis.pros)
-    negative_count = count_real_points(ai_analysis.cons)
-    neutral_count = count_real_points(ai_analysis.neutral_points)
+    positive_count = len(ai_analysis.pros)
+    negative_count = len(ai_analysis.cons)
+    neutral_count = len(ai_analysis.neutral_points)
     total_points = positive_count + negative_count + neutral_count
 
     logger.info(
-        "Sentiment derived from analysis output: %s pros, %s cons, %s neutral points.",
+        "Sentiment derived from point counts: %s pros, %s cons, %s neutral points.",
         positive_count,
         negative_count,
         neutral_count,
@@ -311,7 +303,6 @@ def calculate_sentiment(ai_analysis: AIAnalysis) -> dict[str, int | float]:
             "negative_count": 0,
         }
 
-    # CHANGED: percentages are based on pros/cons/neutral_points counts and rounded to 2 decimals.
     positive_percentage, neutral_percentage, negative_percentage = calculate_percentages(
         positive_count,
         neutral_count,
@@ -701,6 +692,23 @@ def normalize_analysis(ai_analysis: AIAnalysis) -> AIAnalysis:
     )
 
 
+def normalize_analysis_without_fallback(ai_analysis: AIAnalysis) -> AIAnalysis:
+    summary = ai_analysis.summary.strip()
+    pros = deduplicate_points_with_set(ai_analysis.pros)
+    cons = deduplicate_points_with_set(ai_analysis.cons)
+    pros = exclude_existing_points(pros, cons)
+    neutral_points = deduplicate_points_with_set(ai_analysis.neutral_points)
+    neutral_points = exclude_existing_points(neutral_points, pros + cons)
+    neutral_points = filter_generic_neutral_points(neutral_points)
+
+    return AIAnalysis(
+        summary=summary,
+        pros=pros,
+        cons=cons,
+        neutral_points=neutral_points,
+    )
+
+
 def log_analysis_details(ai_analysis: AIAnalysis) -> None:
     logger.debug("Merged pros count: %s", len(ai_analysis.pros))
     logger.debug("Merged cons count: %s", len(ai_analysis.cons))
@@ -802,43 +810,89 @@ def parse_ai_response(raw_text: str) -> AIAnalysis:
         )
 
 
-def get_ai_analysis(reviews: list[str], sentiment: dict[str, int | float]) -> AIAnalysis:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
-    local_analysis = build_fallback_analysis(reviews, sentiment)
-    fallback_analysis = merge_analysis_sources(local_analysis, local_analysis)
-    limited_reviews = list(dict.fromkeys(reviews))[:20]
-    logger.info(
-        "Preparing AI analysis for %s reviews (%s unique reviews sent to Gemini).",
-        len(reviews),
-        len(limited_reviews),
+def prepare_reviews(raw_reviews: list[str]) -> list[str]:
+    split_reviews: list[str] = []
+
+    for raw_review in raw_reviews:
+        for review in raw_review.split("\n"):
+            cleaned_review = review.strip()
+            if cleaned_review:
+                split_reviews.append(cleaned_review)
+
+    if len(split_reviews) > MAX_REVIEWS_TO_ANALYZE:
+        logger.info(
+            "Received %s split reviews; limiting Gemini analysis to first %s.",
+            len(split_reviews),
+            MAX_REVIEWS_TO_ANALYZE,
+        )
+
+    return split_reviews[:MAX_REVIEWS_TO_ANALYZE]
+
+
+def deduplicate_points_with_set(points: list[str]) -> list[str]:
+    normalized_points: list[str] = []
+
+    for point in points:
+        normalized_point = normalize_point(point)
+        if not normalized_point:
+            continue
+        if normalized_point.lower().startswith(GENERIC_POINT_MARKERS):
+            continue
+        normalized_points.append(normalized_point)
+
+    unique_points = list(set(normalized_points))
+    unique_points.sort()
+    return deduplicate_semantic(unique_points)
+
+
+def aggregate_review_analyses(review_analyses: list[AIAnalysis]) -> AIAnalysis:
+    all_pros: list[str] = []
+    all_cons: list[str] = []
+    all_neutral_points: list[str] = []
+    summary_parts: list[str] = []
+
+    for analysis in review_analyses:
+        all_pros.extend(analysis.pros)
+        all_cons.extend(analysis.cons)
+        all_neutral_points.extend(analysis.neutral_points)
+        if analysis.summary.strip():
+            summary_parts.append(analysis.summary.strip())
+
+    pros = deduplicate_points_with_set(all_pros)
+    cons = deduplicate_points_with_set(all_cons)
+    pros = exclude_existing_points(pros, cons)
+    neutral_points = deduplicate_points_with_set(all_neutral_points)
+    neutral_points = exclude_existing_points(neutral_points, pros + cons)
+    neutral_points = filter_generic_neutral_points(neutral_points)
+
+    fallback_summary = " ".join(summary_parts[:3]).strip()
+    if not fallback_summary:
+        fallback_summary = "No summary was returned."
+
+    return AIAnalysis(
+        summary=fallback_summary,
+        pros=pros,
+        cons=cons,
+        neutral_points=neutral_points,
     )
 
-    if not api_key or api_key in PLACEHOLDER_API_KEYS:
-        logger.warning("GEMINI_API_KEY is not configured. Using the local fallback analysis.")
-        log_analysis_details(fallback_analysis)
-        return fallback_analysis
 
-    prompt = f"""
+def build_single_review_prompt(review: str) -> str:
+    return f"""
 You are an expert product analyst.
 
-Analyze the following customer reviews.
+Analyze this single customer review.
 
 Tasks:
-
-1. Generate a concise summary (3-4 lines)
-2. Extract ALL key pros (bullet points)
-3. Extract ALL key cons (bullet points)
-4. Extract neutral or mixed observations (optional)
+1. Extract key pros.
+2. Extract key cons.
+3. Extract neutral or mixed points (optional).
+4. Write a one-line summary.
 
 Rules:
-
-* Do NOT miss any important negative or neutral points
-* Include ALL major issues (price, battery, performance, heating, etc.)
-* Avoid generic statements
-* Avoid duplicates
-* Be specific and feature-based
-* If a problem appears even once, include it
+* Be specific and feature-based.
+* Avoid duplicates.
+* Return only details from this review.
 
 Output format (STRICT JSON):
 {{
@@ -848,40 +902,138 @@ Output format (STRICT JSON):
   "neutral_points": ["...", "..."]
 }}
 
-Reviews:
-{chr(10).join(f"{index + 1}. {review}" for index, review in enumerate(limited_reviews))}
+Review:
+{review}
 """.strip()
+
+
+def request_review_analysis(client: genai.Client, model_name: str, review: str) -> AIAnalysis:
+    response = client.models.generate_content(
+        model=model_name,
+        contents=build_single_review_prompt(review),
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json",
+            response_schema=AIAnalysis,
+        ),
+    )
+    raw_response_text = (response.text or "").strip()
+    if raw_response_text:
+        logger.debug("Gemini single-review raw response: %s", raw_response_text)
+
+    if getattr(response, "parsed", None):
+        parsed = response.parsed
+        validated = parsed if isinstance(parsed, AIAnalysis) else AIAnalysis.model_validate(parsed)
+        return normalize_analysis_without_fallback(validated)
+
+    if raw_response_text:
+        parsed_response = parse_ai_response(raw_response_text)
+        return normalize_analysis_without_fallback(parsed_response)
+
+    raise ValueError("Gemini returned an empty single-review response.")
+
+
+def generate_final_summary(
+    client: genai.Client,
+    model_name: str,
+    pros: list[str],
+    cons: list[str],
+    fallback_summary: str,
+) -> str:
+    if not pros and not cons:
+        return fallback_summary or "No summary was returned."
+
+    prompt = f"""
+Generate a final summary based on these pros and cons.
+
+Pros:
+{chr(10).join(f"- {point}" for point in pros) or "- None"}
+
+Cons:
+{chr(10).join(f"- {point}" for point in cons) or "- None"}
+
+Return only a concise 3-4 sentence summary.
+""".strip()
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="text/plain",
+        ),
+    )
+    summary = (response.text or "").strip()
+    return summary or fallback_summary or "No summary was returned."
+
+
+def get_ai_analysis(reviews: list[str]) -> AIAnalysis:
+    processed_reviews = prepare_reviews(reviews)
+    if not processed_reviews:
+        return AIAnalysis(
+            summary="No summary was returned.",
+            pros=[],
+            cons=[],
+            neutral_points=[],
+        )
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
+    seed_sentiment = {
+        "positive": 0.0,
+        "neutral": 0.0,
+        "negative": 0.0,
+        "total": 0,
+        "score": 0.0,
+        "confidence": 0.0,
+        "positive_count": 0,
+        "neutral_count": 0,
+        "negative_count": 0,
+    }
+    fallback_analysis = normalize_analysis_without_fallback(
+        build_fallback_analysis(processed_reviews, seed_sentiment),
+    )
+    logger.info(
+        "Preparing AI analysis for %s reviews (%s split reviews sent to Gemini).",
+        len(reviews),
+        len(processed_reviews),
+    )
+
+    if not api_key or api_key in PLACEHOLDER_API_KEYS:
+        logger.warning("GEMINI_API_KEY is not configured. Using the local fallback analysis.")
+        log_analysis_details(fallback_analysis)
+        return fallback_analysis
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                response_mime_type="application/json",
-                response_schema=AIAnalysis,
-            ),
+        per_review_analyses: list[AIAnalysis] = []
+
+        for review in processed_reviews:
+            try:
+                per_review_analyses.append(request_review_analysis(client, model_name, review))
+            except Exception as exc:
+                logger.warning("Single-review Gemini analysis failed, using fallback for one review: %s", exc)
+                single_review_fallback = normalize_analysis_without_fallback(
+                    build_fallback_analysis([review], seed_sentiment),
+                )
+                per_review_analyses.append(single_review_fallback)
+
+        aggregated_analysis = aggregate_review_analyses(per_review_analyses)
+        final_summary = generate_final_summary(
+            client,
+            model_name,
+            aggregated_analysis.pros,
+            aggregated_analysis.cons,
+            aggregated_analysis.summary,
         )
-        raw_response_text = (response.text or "").strip()
-        if raw_response_text:
-            logger.debug("Gemini raw response: %s", raw_response_text)
-
-        if getattr(response, "parsed", None):
-            parsed = response.parsed
-            validated = parsed if isinstance(parsed, AIAnalysis) else AIAnalysis.model_validate(parsed)
-            normalized_analysis = normalize_analysis(validated)
-            merged_analysis = merge_analysis_sources(normalized_analysis, local_analysis)
-            log_analysis_details(merged_analysis)
-            return merged_analysis
-
-        if raw_response_text:
-            normalized_analysis = normalize_analysis(parse_ai_response(raw_response_text))
-            merged_analysis = merge_analysis_sources(normalized_analysis, local_analysis)
-            log_analysis_details(merged_analysis)
-            return merged_analysis
-
-        raise ValueError("Gemini returned an empty response.")
+        final_analysis = AIAnalysis(
+            summary=final_summary,
+            pros=aggregated_analysis.pros,
+            cons=aggregated_analysis.cons,
+            neutral_points=aggregated_analysis.neutral_points,
+        )
+        log_analysis_details(final_analysis)
+        return final_analysis
     except (ValidationError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("Gemini returned invalid JSON, switching to the local fallback: %s", exc)
         log_analysis_details(fallback_analysis)
@@ -950,23 +1102,20 @@ def read_root() -> dict[str, str]:
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_reviews(payload: ReviewRequest) -> AnalyzeResponse:
     try:
-        for review in payload.reviews:
+        processed_reviews = prepare_reviews(payload.reviews)
+        if not processed_reviews:
+            raise HTTPException(status_code=400, detail="Please provide at least one non-empty review.")
+
+        for review in processed_reviews:
             if not is_review_related(review):
                 raise HTTPException(status_code=400, detail="Out of scope question is asked.")
 
-        logger.info("Received /analyze request with %s reviews.", len(payload.reviews))
-        seed_sentiment = {
-            "positive": 0.0,
-            "neutral": 0.0,
-            "negative": 0.0,
-            "total": 0,
-            "score": 0.0,
-            "confidence": 0.0,
-            "positive_count": 0,
-            "neutral_count": 0,
-            "negative_count": 0,
-        }
-        ai_analysis = get_ai_analysis(payload.reviews, seed_sentiment)
+        logger.info(
+            "Received /analyze request with %s raw reviews (%s split reviews processed).",
+            len(payload.reviews),
+            len(processed_reviews),
+        )
+        ai_analysis = get_ai_analysis(processed_reviews)
         sentiment = calculate_sentiment(ai_analysis)
         response_payload = AnalyzeResponse(
             summary=ai_analysis.summary,
