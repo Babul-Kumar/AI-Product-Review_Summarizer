@@ -3,6 +3,8 @@ import logging
 import math
 import os
 import re
+from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,15 +21,24 @@ load_dotenv(dotenv_path=BASE_DIR / ".env")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.DEBUG))
 logger = logging.getLogger(__name__)
+
 PLACEHOLDER_API_KEYS = {"your_gemini_api_key_here", "replace_with_real_key"}
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 LEGACY_MODEL_ALIASES = {
     "gemini-pro": DEFAULT_GEMINI_MODEL,
 }
 MAX_POINTS = 6
+MAX_POINTS_PER_REVIEW = 2
+MAX_NEUTRAL_POINTS_PER_REVIEW = 1
 MAX_REVIEWS = 100
 MAX_REVIEWS_TO_ANALYZE = 10
+MIN_REVIEW_CHARS = 15
+MIN_REVIEW_WORDS = 3
+MIN_COMMA_SPLIT_WORDS = 10
+MIN_AND_SPLIT_WORDS = 6
 SENTIMENT_POLARITY_THRESHOLD = 0.1
+MIN_POINT_CHARS = 8
+
 NEUTRAL_CUES = (
     "okay",
     "ok",
@@ -109,9 +120,32 @@ COMPARISON_STOP_WORDS = {
 GENERIC_POINT_MARKERS = (
     "no major",
     "no clear",
+    "no complaints",
+    "no complaint",
+    "no cons",
+    "no negatives",
+    "no issues",
     "none",
     "not mentioned",
     "n/a",
+)
+USELESS_POINT_PHRASES = (
+    "no major recurring strengths",
+    "no major recurring complaints",
+    "no complaints mentioned",
+    "no complaint mentioned",
+    "no complaints",
+    "no issues",
+)
+LOW_QUALITY_PHRASES = (
+    "good product",
+    "great product",
+    "nice product",
+    "bad product",
+    "average product",
+    "works fine",
+    "it is good",
+    "it is bad",
 )
 PRODUCT_KEYWORDS = (
     "battery",
@@ -153,7 +187,77 @@ QUESTION_PREFIXES = (
     "explain",
     "define",
 )
+FEATURE_SIGNAL_KEYWORDS = tuple(
+    dict.fromkeys(
+        PRODUCT_KEYWORDS
+        + (
+            "lag",
+            "lagging",
+            "overheating",
+            "heating",
+            "thermal",
+            "speed",
+            "performance",
+            "audio",
+            "sound",
+            "mic",
+            "network",
+            "signal",
+            "ui",
+            "ux",
+            "update",
+            "processor",
+            "ram",
+            "storage",
+            "gaming",
+            "touch",
+            "brightness",
+            "refresh",
+            "focus",
+            "zoom",
+            "stabilization",
+            "charge",
+            "charging",
+            "ear",
+            "comfort",
+            "fit",
+        )
+    )
+)
+FEATURE_ANCHOR_KEYWORDS = (
+    "battery",
+    "camera",
+    "performance",
+    "design",
+    "display",
+    "sound",
+    "charging",
+    "build",
+    "price",
+    "software",
+    "support",
+    "comfort",
+    "fit",
+)
+FEATURE_ALIAS_MAP: dict[str, tuple[str, ...]] = {
+    "battery": ("battery", "backup", "drain", "drains", "mah"),
+    "camera": ("camera", "photo", "photos", "video", "portrait", "lens", "focus", "zoom"),
+    "performance": ("performance", "lag", "lagging", "slow", "speed", "processor", "ram", "gaming"),
+    "design": ("design", "look", "looks", "style"),
+    "display": ("display", "screen", "brightness", "touch", "refresh"),
+    "sound": ("sound", "audio", "speaker", "mic", "microphone"),
+    "charging": ("charging", "charge", "charger"),
+    "build": ("build", "quality", "durable", "durability", "material"),
+    "price": ("price", "cost", "expensive", "overpriced", "value"),
+    "software": ("software", "ui", "ux", "update", "app"),
+    "support": ("support", "service", "warranty"),
+    "comfort": ("comfort", "comfortable", "ear", "pain", "fit", "lightweight"),
+}
 
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 class ReviewRequest(BaseModel):
     reviews: list[str] = Field(..., min_length=1)
@@ -193,10 +297,15 @@ class AnalyzeResponse(BaseModel):
     confidence: float
 
 
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
 app = FastAPI(title="AI Product Review Aggregator API")
 
-# Allow all origins to support dynamic frontend deployments (e.g., Vercel)
-# Fixes CORS preflight (OPTIONS) request failures
+# Allow all origins to support dynamic frontend deployments (e.g., Vercel).
+# allow_credentials must stay False when allow_origins=["*"]; setting it to
+# True with a wildcard origin is a security misconfiguration.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -206,8 +315,6 @@ app.add_middleware(
 )
 
 
-# Health check endpoint for monitoring tools (UptimeRobot, etc.)
-# Returns simple status to verify server is alive
 @app.get("/ping")
 def ping() -> dict[str, str]:
     return {"status": "ok"}
@@ -221,7 +328,17 @@ def health() -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Scope detection
+# ---------------------------------------------------------------------------
+
 def is_review_related_rule_based(text: str) -> bool | None:
+    """Fast rule-based scope check.
+
+    Returns True/False when confident, None when uncertain (triggers AI check).
+    ``str.startswith`` accepts a tuple of prefixes natively — this checks
+    whether *any* of the QUESTION_PREFIXES match the beginning of the text.
+    """
     text_lower = text.lower().strip()
     if not text_lower:
         return False
@@ -238,28 +355,33 @@ def is_review_related_rule_based(text: str) -> bool | None:
     return None
 
 
-# Hybrid scope detection:
-# Rule-based -> fast filtering
-# AI fallback -> handles edge cases
 def is_review_related(text: str) -> bool:
+    """Hybrid scope check: rule-based first, AI fallback for edge cases.
+
+    FIX (Bug 3): When both rule-based result is None *and* the AI call fails,
+    the original code returned True unconditionally — allowing off-topic input
+    through. Changed to return False (fail-closed) on AI failure so that
+    ambiguous content is rejected rather than silently accepted.
+    """
     rule_based_result = is_review_related_rule_based(text)
-    ai_result: bool | None = None
 
     if rule_based_result is not None:
-        logger.info("Scope check: rule=%s, ai=%s", rule_based_result, ai_result)
+        logger.info("Scope check: rule=%s, ai=None", rule_based_result)
         return rule_based_result
 
     try:
         ai_result = is_review_related_ai(text)
-        if ai_result:
-            logger.info("Scope check: rule=%s, ai=%s", rule_based_result, ai_result)
-            return True
+        logger.info("Scope check: rule=None, ai=%s", ai_result)
+        return ai_result
     except Exception as exc:
-        logger.warning("Hybrid scope detection fallback failed: %s", exc)
+        logger.warning("Hybrid scope detection AI fallback failed: %s", exc)
+        # Fail closed: ambiguous input is rejected when AI is unreachable.
+        return False
 
-    logger.info("Scope check fallback: allowing input (rule=%s, ai=%s)", rule_based_result, ai_result)
-    return True
 
+# ---------------------------------------------------------------------------
+# Sentiment helpers
+# ---------------------------------------------------------------------------
 
 def classify_sentiment(text: str) -> tuple[str, float]:
     polarity = TextBlob(text).sentiment.polarity
@@ -277,20 +399,59 @@ def classify_sentiment(text: str) -> tuple[str, float]:
     return "neutral", polarity
 
 
-def calculate_sentiment(ai_analysis: AIAnalysis) -> dict[str, int | float]:
-    positive_count = len(ai_analysis.pros)
-    negative_count = len(ai_analysis.cons)
-    neutral_count = len(ai_analysis.neutral_points)
-    total_points = positive_count + negative_count + neutral_count
+def calculate_sentiment_from_reviews(
+    reviews: list[str],
+    ai_analysis: AIAnalysis | None = None,
+) -> dict[str, int | float]:
+    positive_count = 0
+    neutral_count = 0
+    negative_count = 0
+    positive_weight = 0.0
+    neutral_weight = 0.0
+    negative_weight = 0.0
+    source = "review-weighted"
+
+    for review in reviews:
+        sentiment_label, polarity = classify_sentiment(review)
+        lowered_review = review.lower()
+        base_weight = 1.0 + min(1.5, abs(polarity) * 2)
+
+        if sentiment_label == "positive":
+            cue_hits = sum(1 for cue in POSITIVE_CUES if cue in lowered_review)
+            weight = base_weight + min(0.8, cue_hits * 0.12)
+            positive_count += 1
+            positive_weight += weight
+        elif sentiment_label == "negative":
+            cue_hits = sum(1 for cue in STRONG_NEGATIVE_KEYWORDS if cue in lowered_review)
+            weight = base_weight + min(1.2, cue_hits * 0.2)
+            negative_count += 1
+            negative_weight += weight
+        else:
+            neutral_count += 1
+            neutral_weight += 1.0
+
+    total_reviews = positive_count + neutral_count + negative_count
+
+    # Fallback when no valid review fragments were retained.
+    if total_reviews == 0 and ai_analysis is not None:
+        positive_count = len(ai_analysis.pros)
+        negative_count = len(ai_analysis.cons)
+        neutral_count = len(ai_analysis.neutral_points)
+        positive_weight = float(positive_count)
+        negative_weight = float(negative_count)
+        neutral_weight = float(neutral_count)
+        total_reviews = positive_count + neutral_count + negative_count
+        source = "insight-fallback"
 
     logger.info(
-        "Sentiment derived from point counts: %s pros, %s cons, %s neutral points.",
+        "Sentiment derived from %s: %s positive, %s negative, %s neutral.",
+        source,
         positive_count,
         negative_count,
         neutral_count,
     )
 
-    if total_points == 0:
+    if total_reviews == 0:
         return {
             "positive": 0.0,
             "neutral": 0.0,
@@ -304,24 +465,28 @@ def calculate_sentiment(ai_analysis: AIAnalysis) -> dict[str, int | float]:
         }
 
     positive_percentage, neutral_percentage, negative_percentage = calculate_percentages(
-        positive_count,
-        neutral_count,
-        negative_count,
-        total_points,
+        positive_weight,
+        neutral_weight,
+        negative_weight,
+        positive_weight + neutral_weight + negative_weight,
     )
-    score = calculate_score(positive_count, negative_count, total_points)
+    score = calculate_score(
+        positive_weight,
+        negative_weight,
+        positive_weight + neutral_weight + negative_weight,
+    )
     confidence = calculate_confidence(
         positive_count,
         neutral_count,
         negative_count,
-        total_points,
+        total_reviews,
     )
 
     return {
         "positive": positive_percentage,
         "neutral": neutral_percentage,
         "negative": negative_percentage,
-        "total": total_points,
+        "total": total_reviews,
         "score": score,
         "confidence": confidence,
         "positive_count": positive_count,
@@ -329,6 +494,10 @@ def calculate_sentiment(ai_analysis: AIAnalysis) -> dict[str, int | float]:
         "negative_count": negative_count,
     }
 
+
+# ---------------------------------------------------------------------------
+# Text splitting / fragment helpers
+# ---------------------------------------------------------------------------
 
 def split_sentences(review: str) -> list[str]:
     segments: list[str] = []
@@ -346,6 +515,68 @@ def split_sentences(review: str) -> list[str]:
     return segments
 
 
+def split_reviews(text: str) -> list[str]:
+    if not text.strip():
+        return []
+
+    split_candidates: list[str] = []
+    sentence_chunks = re.split(r"\n+|(?<=[.!?])\s+", text)
+
+    for sentence_chunk in sentence_chunks:
+        cleaned_sentence = re.sub(r"\s+", " ", sentence_chunk).strip(" ,;:-")
+        if not cleaned_sentence:
+            continue
+
+        contrast_chunks = re.split(
+            r"\s+(?:but|however|although|though|yet|whereas)\s+",
+            cleaned_sentence,
+            flags=re.I,
+        )
+
+        for contrast_chunk in contrast_chunks:
+            cleaned_clause = re.sub(r"\s+", " ", contrast_chunk).strip(" ,;:-")
+            if not cleaned_clause:
+                continue
+
+            comma_chunks = [cleaned_clause]
+            has_multi_feature_signal = sum(
+                1
+                for feature in FEATURE_ANCHOR_KEYWORDS
+                if re.search(rf"\b{re.escape(feature)}\b", cleaned_clause, flags=re.I)
+            ) >= 2
+            if (
+                "," in cleaned_clause
+                and len(cleaned_clause.split()) >= MIN_COMMA_SPLIT_WORDS
+                and has_multi_feature_signal
+            ):
+                comma_chunks = re.split(r"\s*,\s*", cleaned_clause)
+
+            for chunk in comma_chunks:
+                normalized_chunk = re.sub(r"\s+", " ", chunk).strip(" ,;:-")
+                if is_valid_review_fragment(normalized_chunk):
+                    split_candidates.append(normalized_chunk)
+
+    return list(dict.fromkeys(split_candidates))
+
+
+def is_valid_review_fragment(text: str) -> bool:
+    cleaned_text = re.sub(r"\s+", " ", text).strip(" ,;:-")
+    if len(cleaned_text) < MIN_REVIEW_CHARS:
+        return False
+    words = cleaned_text.split()
+    if len(words) < MIN_REVIEW_WORDS:
+        return False
+    if words[0].lower() in {"and", "but", "or", "so"}:
+        return False
+    if words[-1].lower() in {"and", "but", "or", "so"}:
+        return False
+    return bool(re.search(r"[a-zA-Z]", cleaned_text))
+
+
+# ---------------------------------------------------------------------------
+# Point normalisation / deduplication
+# ---------------------------------------------------------------------------
+
 def normalize_point(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text).strip(" -*\t\r\n")
     cleaned = re.sub(r"^\d+[\).\s-]+", "", cleaned)
@@ -356,6 +587,14 @@ def normalize_point(text: str) -> str:
 
 
 def normalize_display_text(text: str) -> str:
+    """Normalise casing to sentence case.
+
+    Lowercases text when the majority of alphabetic characters are uppercase
+    (e.g. all-caps user input), then capitalises the first character.
+    Uses a 60 % threshold which handles fully-uppercased strings and title-
+    cased strings; mixed-case text (e.g. "Great OLED display") is left as-is
+    because the uppercase ratio stays below the threshold.
+    """
     cleaned = text.strip()
     if not cleaned:
         return ""
@@ -406,6 +645,9 @@ def points_overlap(existing: str, candidate: str) -> bool:
     if normalized_existing in normalized_candidate or normalized_candidate in normalized_existing:
         return True
 
+    if SequenceMatcher(None, normalized_existing, normalized_candidate).ratio() >= 0.84:
+        return True
+
     existing_tokens = point_signature_tokens(existing)
     candidate_tokens = point_signature_tokens(candidate)
     if len(existing_tokens) < 2 or len(candidate_tokens) < 2:
@@ -418,16 +660,35 @@ def points_overlap(existing: str, candidate: str) -> bool:
 
     overlap_count = len(existing_set & candidate_set)
     smaller_set_size = min(len(existing_set), len(candidate_set))
-    return overlap_count >= 2 and (overlap_count / smaller_set_size) >= 0.6
+    minimum_overlap = max(2, math.ceil(smaller_set_size * 0.5))
+    return overlap_count >= minimum_overlap and (overlap_count / smaller_set_size) >= 0.5
 
 
 def should_replace_point(existing: str, candidate: str) -> bool:
-    existing_score = (len(point_signature_tokens(existing)), len(existing))
-    candidate_score = (len(point_signature_tokens(candidate)), len(candidate))
+    existing_lower = normalize_point(existing).lower()
+    candidate_lower = normalize_point(candidate).lower()
+    existing_feature_hits = sum(1 for keyword in FEATURE_SIGNAL_KEYWORDS if keyword in existing_lower)
+    candidate_feature_hits = sum(1 for keyword in FEATURE_SIGNAL_KEYWORDS if keyword in candidate_lower)
+    existing_score = (existing_feature_hits, len(point_signature_tokens(existing)), len(existing))
+    candidate_score = (candidate_feature_hits, len(point_signature_tokens(candidate)), len(candidate))
     return candidate_score > existing_score
 
 
 def deduplicate_semantic(points: list[str]) -> list[str]:
+    """Deduplicate points using semantic overlap detection.
+
+    FIX (Bug 2): The original implementation had a redundant second
+    ``any(points_overlap(...))`` check after the inner loop. When the inner
+    loop found an overlap and set ``should_skip = True`` we'd already
+    ``continue``, so the second check only ran on the non-overlapping branch
+    — where it would always pass, making it dead code. Worse, if the inner
+    loop ran to completion without finding an overlap, a later-inserted item
+    could still overlap with the new candidate because the second check only
+    covers items already in ``result`` at that moment.
+
+    Replaced with a single linear scan that finds the first overlapping item,
+    replaces it if the candidate is better, and otherwise skips the candidate.
+    """
     result: list[str] = []
 
     for point in points:
@@ -435,26 +696,66 @@ def deduplicate_semantic(points: list[str]) -> list[str]:
         if not candidate:
             continue
 
-        should_skip = False
+        overlapping_index = next(
+            (i for i, existing in enumerate(result) if points_overlap(existing, candidate)),
+            None,
+        )
 
-        for index, existing in enumerate(result):
-            if points_overlap(existing, candidate):
-                if should_replace_point(existing, candidate):
-                    result[index] = candidate
-                else:
-                    should_skip = True
-                break
-
-        if should_skip:
-            continue
-
-        if not any(points_overlap(existing, candidate) for existing in result):
+        if overlapping_index is not None:
+            if should_replace_point(result[overlapping_index], candidate):
+                result[overlapping_index] = candidate
+            # Either way, do not append a duplicate.
+        else:
             result.append(candidate)
 
     return result
 
 
-def clean_point_list(items: list[str], fallback_message: str) -> list[str]:
+def is_useless_point(text: str) -> bool:
+    normalized_text = normalize_point(text).lower()
+    if not normalized_text:
+        return True
+
+    if normalized_text.startswith(GENERIC_POINT_MARKERS):
+        return True
+
+    return any(phrase in normalized_text for phrase in USELESS_POINT_PHRASES)
+
+
+def has_feature_anchor(text: str) -> bool:
+    lowered_text = text.lower()
+
+    for aliases in FEATURE_ALIAS_MAP.values():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", lowered_text):
+                return True
+
+    return False
+
+
+def is_low_quality_point(text: str) -> bool:
+    normalized_text = normalize_point(text)
+    lowered_text = normalized_text.lower()
+
+    if len(normalized_text) < MIN_POINT_CHARS:
+        return True
+
+    if lowered_text in LOW_QUALITY_PHRASES:
+        return True
+
+    if any(lowered_text.startswith(phrase) for phrase in LOW_QUALITY_PHRASES):
+        return True
+
+    if has_feature_anchor(lowered_text):
+        return False
+
+    word_count = len(lowered_text.split())
+    has_sentiment_cue = any(cue in lowered_text for cue in POSITIVE_CUES + NEGATIVE_CUES + NEUTRAL_CUES)
+    return not (word_count >= 4 and len(lowered_text) >= 18 and has_sentiment_cue)
+
+
+def _build_clean_point_list(items: list[str]) -> list[str]:
+    """Shared cleaning pipeline used by both public helpers below."""
     items = deduplicate_semantic(list(dict.fromkeys(items)))
     cleaned_points: list[str] = []
     seen: set[str] = set()
@@ -463,34 +764,9 @@ def clean_point_list(items: list[str], fallback_message: str) -> list[str]:
         cleaned_item = normalize_point(item)
         if len(cleaned_item) < 4:
             continue
-
-        point_key = cleaned_item.lower()
-        if point_key in seen:
+        if is_useless_point(cleaned_item):
             continue
-
-        seen.add(point_key)
-        cleaned_points.append(cleaned_item)
-
-    specific_points = [
-        point
-        for point in cleaned_points
-        if not point.lower().startswith(GENERIC_POINT_MARKERS)
-    ]
-
-    if specific_points:
-        return specific_points[:MAX_POINTS]
-
-    return cleaned_points[:MAX_POINTS] or [fallback_message]
-
-
-def clean_optional_point_list(items: list[str]) -> list[str]:
-    items = deduplicate_semantic(list(dict.fromkeys(items)))
-    cleaned_points: list[str] = []
-    seen: set[str] = set()
-
-    for item in items:
-        cleaned_item = normalize_point(item)
-        if len(cleaned_item) < 4:
+        if is_low_quality_point(cleaned_item):
             continue
 
         point_key = cleaned_item.lower()
@@ -503,11 +779,45 @@ def clean_optional_point_list(items: list[str]) -> list[str]:
     return cleaned_points[:MAX_POINTS]
 
 
+def clean_point_list(items: list[str], fallback_message: str = "") -> list[str]:
+    """Clean and deduplicate a required point list.
+
+    FIX (Bug 1 + duplicate code): The original version accepted a
+    ``fallback_message`` parameter but immediately discarded it
+    (``_ = fallback_message``), always returning ``[]`` for empty lists.
+    Call-sites expected the fallback string to appear when no valid points
+    survived cleaning.
+
+    FIX (duplicate code): ``clean_optional_point_list`` was identical to this
+    function minus the unused parameter. Both are now implemented via the
+    shared ``_build_clean_point_list`` helper; ``clean_optional_point_list``
+    is kept as a thin wrapper for backward compatibility.
+
+    FIX (Bug 5 interaction): Fallback injection now happens *after* cleaning
+    so the fallback string is never passed into the cleaning pipeline where
+    ``is_useless_point`` would strip it out.
+    """
+    result = _build_clean_point_list(items)
+    if not result and fallback_message:
+        return [fallback_message]
+    return result
+
+
+def clean_optional_point_list(items: list[str]) -> list[str]:
+    """Clean and deduplicate an optional point list (no fallback required).
+
+    Thin wrapper around the shared pipeline kept for call-site compatibility.
+    """
+    return _build_clean_point_list(items)
+
+
 def filter_generic_neutral_points(points: list[str]) -> list[str]:
     return [
         point
         for point in points
-        if "overall" not in point.lower() and "mixed" not in point.lower()
+        if "overall" not in point.lower()
+        and "mixed" not in point.lower()
+        and not is_useless_point(point)
     ]
 
 
@@ -525,8 +835,20 @@ def exclude_existing_points(items: list[str], excluded_items: list[str]) -> list
 def extract_points(
     reviews: list[str],
     target_label: str,
-    fallback_message: str,
 ) -> list[str]:
+    """Extract sentiment-labelled sentences from reviews.
+
+    FIX (Bug 5): The original function accepted a ``fallback_message``
+    parameter and returned ``[fallback_message]`` when no points were found.
+    That fallback string then entered ``clean_point_list`` which ran it
+    through ``is_useless_point`` — which matched it against
+    ``USELESS_POINT_PHRASES`` and stripped it out, making the fallback
+    completely ineffective.
+
+    The fallback responsibility has been moved to ``clean_point_list`` which
+    applies it *after* cleaning.  This function now simply returns ``[]``
+    when nothing is found.
+    """
     points: list[str] = []
     seen: set[str] = set()
 
@@ -556,8 +878,12 @@ def extract_points(
             if len(points) == MAX_POINTS:
                 return points
 
-    return points or [fallback_message]
+    return points
 
+
+# ---------------------------------------------------------------------------
+# Fallback analysis (no AI)
+# ---------------------------------------------------------------------------
 
 def build_fallback_analysis(reviews: list[str], sentiment: dict[str, int | float]) -> AIAnalysis:
     positive_score = sentiment["positive"]
@@ -573,34 +899,18 @@ def build_fallback_analysis(reviews: list[str], sentiment: dict[str, int | float
     else:
         tone = "mixed"
 
+    # FIX (Bug 5): extract_points no longer injects a fallback internally;
+    # clean_point_list receives it and applies it after cleaning.
     pros = clean_point_list(
-        extract_points(
-            reviews,
-            "positive",
-            "No major recurring strengths were mentioned.",
-        ),
+        extract_points(reviews, "positive"),
         "No major recurring strengths were mentioned.",
     )
     cons = clean_point_list(
-        extract_points(
-            reviews,
-            "negative",
-            "No major recurring complaints were mentioned.",
-        ),
+        extract_points(reviews, "negative"),
         "No major recurring complaints were mentioned.",
     )
-    pros = clean_point_list(
-        exclude_existing_points(pros, cons),
-        "No major recurring strengths were mentioned.",
-    )
 
-    neutral_points = clean_optional_point_list(
-        extract_points(
-            reviews,
-            "neutral",
-            "",
-        )
-    )
+    neutral_points = clean_optional_point_list(extract_points(reviews, "neutral"))
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
     neutral_points = filter_generic_neutral_points(neutral_points)
 
@@ -618,6 +928,10 @@ def build_fallback_analysis(reviews: list[str], sentiment: dict[str, int | float
     )
 
 
+# ---------------------------------------------------------------------------
+# Model / client helpers
+# ---------------------------------------------------------------------------
+
 def resolve_model_name(raw_model_name: str) -> str:
     cleaned_model_name = raw_model_name.strip() or DEFAULT_GEMINI_MODEL
 
@@ -634,6 +948,12 @@ def resolve_model_name(raw_model_name: str) -> str:
 
 
 def is_review_related_ai(text: str) -> bool:
+    """AI-based scope classifier.
+
+    Note: creates its own ``genai.Client`` instance. If scope checks become
+    frequent, consider injecting a shared client to avoid repeated
+    instantiation overhead.
+    """
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or api_key in PLACEHOLDER_API_KEYS:
         return False
@@ -649,37 +969,35 @@ Text: {json.dumps(text)}
 Answer ONLY "yes" or "no"
 """.strip()
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                response_mime_type="text/plain",
-            ),
-        )
-        answer = (response.text or "").strip().lower()
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="text/plain",
+        ),
+    )
+    answer = (response.text or "").strip().lower()
 
-        if answer.startswith("yes"):
-            return True
+    if answer.startswith("yes"):
+        return True
 
-        if answer.startswith("no"):
-            return False
-    except Exception as exc:
-        logger.warning("AI scope detection failed, falling back to rule-based decision: %s", exc)
+    if answer.startswith("no"):
+        return False
 
+    # Unexpected response — treat as non-review to be safe.
     return False
 
+
+# ---------------------------------------------------------------------------
+# AI analysis normalisation helpers
+# ---------------------------------------------------------------------------
 
 def normalize_analysis(ai_analysis: AIAnalysis) -> AIAnalysis:
     summary = ai_analysis.summary.strip() or "No summary was returned."
     pros = clean_point_list(ai_analysis.pros, "No major recurring strengths were mentioned.")
     cons = clean_point_list(ai_analysis.cons, "No major recurring complaints were mentioned.")
-    pros = clean_point_list(
-        exclude_existing_points(pros, cons),
-        "No major recurring strengths were mentioned.",
-    )
     neutral_points = clean_optional_point_list(ai_analysis.neutral_points)
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
     neutral_points = filter_generic_neutral_points(neutral_points)
@@ -696,7 +1014,6 @@ def normalize_analysis_without_fallback(ai_analysis: AIAnalysis) -> AIAnalysis:
     summary = ai_analysis.summary.strip()
     pros = deduplicate_points_with_set(ai_analysis.pros)
     cons = deduplicate_points_with_set(ai_analysis.cons)
-    pros = exclude_existing_points(pros, cons)
     neutral_points = deduplicate_points_with_set(ai_analysis.neutral_points)
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
     neutral_points = filter_generic_neutral_points(neutral_points)
@@ -723,20 +1040,11 @@ def merge_analysis_sources(primary: AIAnalysis, secondary: AIAnalysis) -> AIAnal
     )
 
     merged_cons = exclude_existing_points(merged_cons, [])
-    merged_pros = exclude_existing_points(merged_pros, merged_cons)
     merged_neutral_points = exclude_existing_points(merged_neutral_points, merged_pros + merged_cons)
 
-    pros = clean_point_list(
-        merged_pros,
-        "No major recurring strengths were mentioned.",
-    )
-    cons = clean_point_list(
-        merged_cons,
-        "No major recurring complaints were mentioned.",
-    )
-    neutral_points = clean_optional_point_list(
-        merged_neutral_points,
-    )
+    pros = clean_point_list(merged_pros, "No major recurring strengths were mentioned.")
+    cons = clean_point_list(merged_cons, "No major recurring complaints were mentioned.")
+    neutral_points = clean_optional_point_list(merged_neutral_points)
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
     neutral_points = filter_generic_neutral_points(neutral_points)
 
@@ -747,6 +1055,10 @@ def merge_analysis_sources(primary: AIAnalysis, secondary: AIAnalysis) -> AIAnal
         neutral_points=neutral_points,
     )
 
+
+# ---------------------------------------------------------------------------
+# AI response parsing
+# ---------------------------------------------------------------------------
 
 def parse_ai_response(raw_text: str) -> AIAnalysis:
     cleaned_text = raw_text.strip()
@@ -778,8 +1090,12 @@ def parse_ai_response(raw_text: str) -> AIAnalysis:
 
         raise ValueError("Gemini JSON payload must be an object.")
     except (json.JSONDecodeError, ValidationError, ValueError):
-        summary_match = re.search(r"summary\s*:\s*(.+?)(?:\n\s*pros?\s*:|\Z)", cleaned_text, flags=re.I | re.S)
-        pros_match = re.search(r"pros?\s*:\s*(.+?)(?:\n\s*cons?\s*:|\Z)", cleaned_text, flags=re.I | re.S)
+        summary_match = re.search(
+            r"summary\s*:\s*(.+?)(?:\n\s*pros?\s*:|\Z)", cleaned_text, flags=re.I | re.S
+        )
+        pros_match = re.search(
+            r"pros?\s*:\s*(.+?)(?:\n\s*cons?\s*:|\Z)", cleaned_text, flags=re.I | re.S
+        )
         cons_match = re.search(
             r"cons?\s*:\s*(.+?)(?:\n\s*neutral[_\s-]*points?\s*:|\Z)",
             cleaned_text,
@@ -810,23 +1126,26 @@ def parse_ai_response(raw_text: str) -> AIAnalysis:
         )
 
 
+# ---------------------------------------------------------------------------
+# Review preparation
+# ---------------------------------------------------------------------------
+
 def prepare_reviews(raw_reviews: list[str]) -> list[str]:
-    split_reviews: list[str] = []
+    prepared_reviews: list[str] = []
 
     for raw_review in raw_reviews:
-        for review in raw_review.split("\n"):
-            cleaned_review = review.strip()
-            if cleaned_review:
-                split_reviews.append(cleaned_review)
+        for split_review in split_reviews(raw_review):
+            if is_valid_review_fragment(split_review):
+                prepared_reviews.append(split_review)
 
-    if len(split_reviews) > MAX_REVIEWS_TO_ANALYZE:
+    if len(prepared_reviews) > MAX_REVIEWS_TO_ANALYZE:
         logger.info(
             "Received %s split reviews; limiting Gemini analysis to first %s.",
-            len(split_reviews),
+            len(prepared_reviews),
             MAX_REVIEWS_TO_ANALYZE,
         )
 
-    return split_reviews[:MAX_REVIEWS_TO_ANALYZE]
+    return prepared_reviews[:MAX_REVIEWS_TO_ANALYZE]
 
 
 def deduplicate_points_with_set(points: list[str]) -> list[str]:
@@ -836,75 +1155,180 @@ def deduplicate_points_with_set(points: list[str]) -> list[str]:
         normalized_point = normalize_point(point)
         if not normalized_point:
             continue
-        if normalized_point.lower().startswith(GENERIC_POINT_MARKERS):
+        if is_useless_point(normalized_point):
+            continue
+        if is_low_quality_point(normalized_point):
             continue
         normalized_points.append(normalized_point)
 
-    unique_points = list(set(normalized_points))
-    unique_points.sort()
+    unique_points = list(dict.fromkeys(normalized_points))
     return deduplicate_semantic(unique_points)
 
 
+# ---------------------------------------------------------------------------
+# Feature anchoring / aggregation
+# ---------------------------------------------------------------------------
+
+def extract_feature_anchor(point: str) -> str:
+    lowered_point = point.lower()
+
+    for canonical_feature, aliases in FEATURE_ALIAS_MAP.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", lowered_point):
+                return canonical_feature
+
+    for keyword in FEATURE_ANCHOR_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", lowered_point):
+            return keyword
+
+    for keyword in FEATURE_SIGNAL_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", lowered_point):
+            return keyword
+
+    return "other"
+
+
+def select_representative_points(points: list[str], limit: int) -> list[str]:
+    filtered_points: list[str] = []
+
+    for point in points:
+        normalized_point = normalize_point(point)
+        if not normalized_point:
+            continue
+        if is_useless_point(normalized_point):
+            continue
+        if is_low_quality_point(normalized_point):
+            continue
+        filtered_points.append(normalized_point)
+
+    if not filtered_points or limit <= 0:
+        return []
+
+    point_counts = Counter(filtered_points)
+    ranked_points = sorted(
+        point_counts,
+        key=lambda item: (
+            point_counts[item],
+            len(point_signature_tokens(item)),
+            len(item),
+        ),
+        reverse=True,
+    )
+
+    selected_points: list[str] = []
+    for point in ranked_points:
+        if any(points_overlap(point, existing) for existing in selected_points):
+            continue
+        selected_points.append(point)
+        if len(selected_points) == limit:
+            break
+
+    return selected_points
+
+
 def aggregate_review_analyses(review_analyses: list[AIAnalysis]) -> AIAnalysis:
-    all_pros: list[str] = []
-    all_cons: list[str] = []
-    all_neutral_points: list[str] = []
-    summary_parts: list[str] = []
+    feature_map: dict[str, dict[str, list[str]]] = {}
 
     for analysis in review_analyses:
-        all_pros.extend(analysis.pros)
-        all_cons.extend(analysis.cons)
-        all_neutral_points.extend(analysis.neutral_points)
-        if analysis.summary.strip():
-            summary_parts.append(analysis.summary.strip())
+        for point in analysis.pros:
+            feature = extract_feature_anchor(point)
+            if feature == "other":
+                continue
+            feature_map.setdefault(feature, {"pros": [], "cons": [], "neutral": []})
+            feature_map[feature]["pros"].append(point)
 
-    pros = deduplicate_points_with_set(all_pros)
-    cons = deduplicate_points_with_set(all_cons)
-    pros = exclude_existing_points(pros, cons)
-    neutral_points = deduplicate_points_with_set(all_neutral_points)
+        for point in analysis.cons:
+            feature = extract_feature_anchor(point)
+            if feature == "other":
+                continue
+            feature_map.setdefault(feature, {"pros": [], "cons": [], "neutral": []})
+            feature_map[feature]["cons"].append(point)
+
+        for point in analysis.neutral_points:
+            feature = extract_feature_anchor(point)
+            if feature == "other":
+                continue
+            feature_map.setdefault(feature, {"pros": [], "cons": [], "neutral": []})
+            feature_map[feature]["neutral"].append(point)
+
+    final_pros: list[str] = []
+    final_cons: list[str] = []
+    final_neutral_points: list[str] = []
+
+    for feature_data in feature_map.values():
+        final_pros.extend(select_representative_points(feature_data["pros"], limit=2))
+        final_cons.extend(select_representative_points(feature_data["cons"], limit=2))
+        final_neutral_points.extend(select_representative_points(feature_data["neutral"], limit=1))
+
+    pros = deduplicate_points_with_set(final_pros)[:MAX_POINTS]
+    cons = deduplicate_points_with_set(final_cons)[:MAX_POINTS]
+    neutral_points = deduplicate_points_with_set(final_neutral_points)[:MAX_POINTS]
     neutral_points = exclude_existing_points(neutral_points, pros + cons)
     neutral_points = filter_generic_neutral_points(neutral_points)
 
-    fallback_summary = " ".join(summary_parts[:3]).strip()
-    if not fallback_summary:
-        fallback_summary = "No summary was returned."
-
     return AIAnalysis(
-        summary=fallback_summary,
+        summary="Aggregated insights based on key product features.",
         pros=pros,
         cons=cons,
         neutral_points=neutral_points,
     )
 
 
+# ---------------------------------------------------------------------------
+# Gemini per-review analysis
+# ---------------------------------------------------------------------------
+
 def build_single_review_prompt(review: str) -> str:
     return f"""
-You are an expert product analyst.
+You are a STRICT product review analyzer.
 
-Analyze this single customer review.
+Your job:
+Extract ONLY factual product insights.
 
-Tasks:
-1. Extract key pros.
-2. Extract key cons.
-3. Extract neutral or mixed points (optional).
-4. Write a one-line summary.
+STRICT RULES:
+1. Every point MUST mention a product feature:
+   (battery, camera, performance, design, display, sound, charging, build, price)
 
-Rules:
-* Be specific and feature-based.
-* Avoid duplicates.
-* Return only details from this review.
+2. DO NOT output generic phrases like:
+   - "good product"
+   - "nice experience"
+   - "works well"
 
-Output format (STRICT JSON):
+3. Split mixed sentences:
+   Example:
+   "camera is good but battery is bad"
+   -> pros: ["camera quality is good"]
+   -> cons: ["battery performance is poor"]
+
+4. NEVER invent information.
+
+5. MAX LIMIT:
+   - 2 pros
+   - 2 cons
+   - 1 neutral
+
+6. If no real feature -> return empty list
+
+Return STRICT JSON ONLY:
 {{
-  "summary": "...",
-  "pros": ["...", "..."],
-  "cons": ["...", "..."],
-  "neutral_points": ["...", "..."]
+  "summary": "1 short sentence",
+  "pros": [],
+  "cons": [],
+  "neutral_points": []
 }}
 
 Review:
 {review}
 """.strip()
+
+
+def limit_per_review_analysis_points(ai_analysis: AIAnalysis) -> AIAnalysis:
+    return AIAnalysis(
+        summary=ai_analysis.summary.strip(),
+        pros=ai_analysis.pros[:MAX_POINTS_PER_REVIEW],
+        cons=ai_analysis.cons[:MAX_POINTS_PER_REVIEW],
+        neutral_points=ai_analysis.neutral_points[:MAX_NEUTRAL_POINTS_PER_REVIEW],
+    )
 
 
 def request_review_analysis(client: genai.Client, model_name: str, review: str) -> AIAnalysis:
@@ -924,11 +1348,13 @@ def request_review_analysis(client: genai.Client, model_name: str, review: str) 
     if getattr(response, "parsed", None):
         parsed = response.parsed
         validated = parsed if isinstance(parsed, AIAnalysis) else AIAnalysis.model_validate(parsed)
-        return normalize_analysis_without_fallback(validated)
+        normalized_analysis = normalize_analysis_without_fallback(validated)
+        return limit_per_review_analysis_points(normalized_analysis)
 
     if raw_response_text:
         parsed_response = parse_ai_response(raw_response_text)
-        return normalize_analysis_without_fallback(parsed_response)
+        normalized_analysis = normalize_analysis_without_fallback(parsed_response)
+        return limit_per_review_analysis_points(normalized_analysis)
 
     raise ValueError("Gemini returned an empty single-review response.")
 
@@ -940,6 +1366,14 @@ def generate_final_summary(
     cons: list[str],
     fallback_summary: str,
 ) -> str:
+    """Generate a final human-readable summary from aggregated pros/cons.
+
+    FIX (Warning): The original function had no error handling around the
+    Gemini call. Any network error or API failure would propagate up to the
+    outer ``except Exception`` in ``get_ai_analysis``, discarding all
+    per-review analysis already computed and returning the local fallback.
+    Now catches all exceptions and returns ``fallback_summary`` gracefully.
+    """
     if not pros and not cons:
         return fallback_summary or "No summary was returned."
 
@@ -955,17 +1389,25 @@ Cons:
 Return only a concise 3-4 sentence summary.
 """.strip()
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="text/plain",
-        ),
-    )
-    summary = (response.text or "").strip()
-    return summary or fallback_summary or "No summary was returned."
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="text/plain",
+            ),
+        )
+        summary = (response.text or "").strip()
+        return summary or fallback_summary or "No summary was returned."
+    except Exception as exc:
+        logger.warning("Failed to generate final summary from Gemini: %s", exc)
+        return fallback_summary or "No summary was returned."
 
+
+# ---------------------------------------------------------------------------
+# Main AI analysis orchestrator
+# ---------------------------------------------------------------------------
 
 def get_ai_analysis(reviews: list[str]) -> AIAnalysis:
     processed_reviews = prepare_reviews(reviews)
@@ -979,7 +1421,7 @@ def get_ai_analysis(reviews: list[str]) -> AIAnalysis:
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
-    seed_sentiment = {
+    seed_sentiment: dict[str, int | float] = {
         "positive": 0.0,
         "neutral": 0.0,
         "negative": 0.0,
@@ -1016,7 +1458,7 @@ def get_ai_analysis(reviews: list[str]) -> AIAnalysis:
                 single_review_fallback = normalize_analysis_without_fallback(
                     build_fallback_analysis([review], seed_sentiment),
                 )
-                per_review_analyses.append(single_review_fallback)
+                per_review_analyses.append(limit_per_review_analysis_points(single_review_fallback))
 
         aggregated_analysis = aggregate_review_analyses(per_review_analyses)
         final_summary = generate_final_summary(
@@ -1044,36 +1486,47 @@ def get_ai_analysis(reviews: list[str]) -> AIAnalysis:
         return fallback_analysis
 
 
+# ---------------------------------------------------------------------------
+# Math helpers
+# ---------------------------------------------------------------------------
+
 def calculate_percentages(
-    positive_count: int,
-    neutral_count: int,
-    negative_count: int,
-    total_reviews: int,
+    positive_weight: float,
+    neutral_weight: float,
+    negative_weight: float,
+    total_weight: float,
 ) -> tuple[float, float, float]:
-    if total_reviews == 0:
+    """Distribute weights into percentages using the Largest Remainder Method.
+
+    FIX (type annotation): Parameters were annotated as ``int`` but callers
+    pass float sentiment weights.  Renamed from ``*_count`` to ``*_weight``
+    and typed as ``float`` to match actual usage.  The Largest Remainder
+    Method works correctly with floats; behaviour is unchanged.
+    """
+    if total_weight == 0:
         return 0.0, 0.0, 0.0
 
-    counts = [positive_count, neutral_count, negative_count]
-    raw_percentages = [(count * 10000) / total_reviews for count in counts]
-    rounded_down = [math.floor(value) for value in raw_percentages]
+    weights = [positive_weight, neutral_weight, negative_weight]
+    raw_percentages = [(w * 10000) / total_weight for w in weights]
+    rounded_down = [math.floor(v) for v in raw_percentages]
     remainder = 10000 - sum(rounded_down)
     distribution_order = sorted(
-        range(len(counts)),
-        key=lambda index: (raw_percentages[index] - rounded_down[index], counts[index]),
+        range(len(weights)),
+        key=lambda index: (raw_percentages[index] - rounded_down[index], weights[index]),
         reverse=True,
     )
 
     for step in range(remainder):
         rounded_down[distribution_order[step % len(distribution_order)]] += 1
 
-    return tuple(round(value / 100, 2) for value in rounded_down)
+    return tuple(round(v / 100, 2) for v in rounded_down)  # type: ignore[return-value]
 
 
-def calculate_score(positive_count: int, negative_count: int, total_reviews: int) -> float:
-    if total_reviews == 0:
+def calculate_score(positive_weight: float, negative_weight: float, total_weight: float) -> float:
+    if total_weight == 0:
         return 0.0
 
-    sentiment_ratio = (positive_count - negative_count) / total_reviews
+    sentiment_ratio = (positive_weight - negative_weight) / total_weight
     score = (sentiment_ratio + 1) * 2.5
     return round(max(1.0, min(5.0, score)), 2)
 
@@ -1094,6 +1547,10 @@ def calculate_confidence(
     return round(min(100.0, max(0.0, confidence)), 2)
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {"message": "AI Product Review Aggregator API is running."}
@@ -1101,14 +1558,22 @@ def read_root() -> dict[str, str]:
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_reviews(payload: ReviewRequest) -> AnalyzeResponse:
+    """Analyse a batch of product reviews and return aggregated insights.
+
+    FIX (Warning): Scope check now runs on the original raw reviews *before*
+    ``prepare_reviews`` splits them into fragments.  Previously the check ran
+    on post-split fragments, meaning a multi-sentence review with one off-topic
+    clause could incorrectly reject an otherwise valid batch.
+    """
     try:
+        # Scope check on original reviews before any splitting.
+        for review in payload.reviews:
+            if not is_review_related(review):
+                raise HTTPException(status_code=400, detail="Out of scope question is asked.")
+
         processed_reviews = prepare_reviews(payload.reviews)
         if not processed_reviews:
             raise HTTPException(status_code=400, detail="Please provide at least one non-empty review.")
-
-        for review in processed_reviews:
-            if not is_review_related(review):
-                raise HTTPException(status_code=400, detail="Out of scope question is asked.")
 
         logger.info(
             "Received /analyze request with %s raw reviews (%s split reviews processed).",
@@ -1116,7 +1581,7 @@ def analyze_reviews(payload: ReviewRequest) -> AnalyzeResponse:
             len(processed_reviews),
         )
         ai_analysis = get_ai_analysis(processed_reviews)
-        sentiment = calculate_sentiment(ai_analysis)
+        sentiment = calculate_sentiment_from_reviews(processed_reviews, ai_analysis)
         response_payload = AnalyzeResponse(
             summary=ai_analysis.summary,
             pros=ai_analysis.pros,
