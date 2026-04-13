@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import SentimentChart from "./components/SentimentChart";
 
 // ==============================================================================
@@ -22,6 +22,7 @@ const log = {
 // Environment Variables
 const API_BASE_URL = import.meta.env.VITE_API_URL || "https://ai-product-review.onrender.com";
 const ANALYZE_URL = `${API_BASE_URL}/analyze-raw`;
+const ANALYZE_STREAM_URL = `${API_BASE_URL}/analyze-stream`; // ✅ New streaming endpoint
 const PING_URL = `${API_BASE_URL}/ping`;
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 
@@ -31,10 +32,23 @@ const LOW_QUALITY_MESSAGE = "Please enter meaningful product reviews to get accu
 const COOLDOWN_MS = 3000;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_BASE = 1500;
-const REQUEST_TIMEOUT_MS = 60000;
+const REQUEST_TIMEOUT_MS = 20000;
 const HEALTH_CHECK_INTERVAL = 30000;
-const MAX_REVIEWS_LIMIT = 30;
-const CACHE_TTL = 60000;
+const MAX_REVIEWS_LIMIT = 5;
+const CACHE_TTL = 120000;
+const MAX_INPUT_LENGTH = 5000;
+const SLOW_LOADING_THRESHOLD = 5000;
+
+// ✅ STREAMING: Stage configurations
+const STREAM_STAGES = {
+  SUMMARY: { order: 0, name: "summary", icon: "📝", label: "Generating summary..." },
+  PROS: { order: 1, name: "pros", icon: "👍", label: "Extracting pros..." },
+  CONS: { order: 2, name: "cons", icon: "👎", label: "Identifying cons..." },
+  NEUTRAL: { order: 3, name: "neutral_points", icon: "➖", label: "Finding neutral points..." },
+  FEATURES: { order: 4, name: "feature_scores", icon: "⭐", label: "Scoring features..." },
+  SENTIMENT: { order: 5, name: "sentiment", icon: "📊", label: "Analyzing sentiment..." },
+  COMPLETE: { order: 6, name: "complete", icon: "✅", label: "Complete!" },
+};
 
 // Non-meaningful patterns
 const NON_MEANINGFUL_PATTERNS = [
@@ -83,7 +97,12 @@ function toSafeNumber(value) {
 
 function toSafeList(value) {
   if (!Array.isArray(value)) return [];
-  return value.map((item) => String(item).trim()).filter(Boolean);
+  
+  return value.map((item) => {
+    if (typeof item === "string") return item.trim();
+    if (item && typeof item === "object") return item.text || "";
+    return "";
+  }).filter(Boolean);
 }
 
 function normalizeResult(data) {
@@ -134,9 +153,7 @@ function isMeaningfulReview(text) {
   return text.length > 10 && /[a-zA-Z]/.test(text);
 }
 
-// ✅ NEW: Safe feature score extraction
 function extractFeatureScore(featureScore) {
-  // Handle { feature: "battery", score: 4.5 }
   if (featureScore && typeof featureScore === "object" && !Array.isArray(featureScore)) {
     return {
       feature: String(featureScore.feature || "").trim(),
@@ -144,7 +161,6 @@ function extractFeatureScore(featureScore) {
     };
   }
   
-  // Handle ["battery", 4.5]
   if (Array.isArray(featureScore) && featureScore.length >= 2) {
     return {
       feature: String(featureScore[0] || "").trim(),
@@ -152,8 +168,7 @@ function extractFeatureScore(featureScore) {
     };
   }
   
-  // Handle "battery" (just feature name without score)
-  if (typeof featureScore === "string") {
+  if (typeof featureScore === "string" && featureScore.trim()) {
     return {
       feature: featureScore.trim(),
       score: 0,
@@ -161,6 +176,94 @@ function extractFeatureScore(featureScore) {
   }
   
   return { feature: "", score: 0 };
+}
+
+function isValidFeatureScore(featureScore) {
+  const { feature, score } = extractFeatureScore(featureScore);
+  if (!feature && score === 0) return false;
+  if (feature === "Unknown feature" || feature === "") return false;
+  return true;
+}
+
+function compressReviews(reviews) {
+  return reviews.slice(0, MAX_REVIEWS_LIMIT).map(review => {
+    if (review.length > 200) {
+      return review.substring(0, 200) + "...";
+    }
+    return review;
+  });
+}
+
+function analyzeReviewLine(line, index) {
+  const trimmed = line.trim();
+  const isTooShort = trimmed.length > 0 && trimmed.length < 10;
+  const hasNoLetters = trimmed.length > 0 && !/[a-zA-Z]/.test(trimmed);
+  const isEmpty = trimmed.length === 0;
+  
+  return {
+    index,
+    original: line,
+    trimmed,
+    isValid: !isEmpty && !isTooShort && !hasNoLetters && trimmed.length >= 10,
+    isTooShort,
+    hasNoLetters,
+    isEmpty,
+    status: isEmpty ? "skipped" : isTooShort ? "invalid" : hasNoLetters ? "invalid" : "valid"
+  };
+}
+
+// ✅ STREAMING: Create initial partial result structure
+function createPartialResult() {
+  return {
+    summary: null,           // First - fastest
+    pros: null,              // Second
+    cons: null,              // Third
+    neutral_points: null,    // Fourth
+    feature_scores: null,    // Fifth
+    sentiment: null,         // Last - slowest
+    score: null,
+    confidence: null,
+    _meta: {
+      completedStages: [],
+      streaming: true,
+    }
+  };
+}
+
+// ✅ STREAMING: Update partial result
+function updatePartialResult(current, type, data) {
+  const newResult = { ...current };
+  
+  switch (type) {
+    case "summary":
+      newResult.summary = data;
+      break;
+    case "pros":
+      newResult.pros = toSafeList(data);
+      break;
+    case "cons":
+      newResult.cons = toSafeList(data);
+      break;
+    case "neutral_points":
+      newResult.neutral_points = toSafeList(data);
+      break;
+    case "feature_scores":
+      newResult.feature_scores = Array.isArray(data) ? data : [];
+      break;
+    case "sentiment":
+      newResult.sentiment = data;
+      newResult.score = toSafeNumber(data?.score);
+      newResult.confidence = toSafeNumber(data?.confidence);
+      break;
+    case "complete":
+      newResult._meta.completedStages.push(type);
+      break;
+  }
+  
+  if (!newResult._meta) newResult._meta = { completedStages: [], streaming: true };
+  newResult._meta.completedStages.push(type);
+  
+  return newResult;
 }
 
 // ==============================================================================
@@ -222,6 +325,71 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 
   }
 }
 
+// ✅ STREAMING: Stream fetch with progressive updates
+async function fetchWithStreaming(url, options, onChunk, onStage, signal, requestId) {
+  const startTime = Date.now();
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    if (!reader) {
+      throw new Error("Streaming not supported");
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (done) break;
+      
+      buffer += decoder.decode(value, { stream: true });
+      
+      // Process complete JSON lines
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || ""; // Keep incomplete line in buffer
+      
+      for (const line of lines) {
+        if (!line.trim() || line.trim() === "[DONE]") continue;
+        
+        try {
+          const parsed = JSON.parse(line);
+          const { type, data } = parsed;
+          
+          log.debug(`[Stream:${type}]`, data);
+          onChunk(type, data);
+          
+          // Notify current stage
+          const stage = STREAM_STAGES[type.toUpperCase()] || STREAM_STAGES[type];
+          if (stage) {
+            onStage(stage, data);
+          }
+        } catch (e) {
+          // Ignore parse errors for incomplete chunks
+        }
+      }
+    }
+
+    const duration = Date.now() - startTime;
+    return { success: true, duration };
+
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw { isAbort: true, message: "Request cancelled" };
+    }
+    throw error;
+  }
+}
+
 // ==============================================================================
 // MAIN COMPONENT
 // ==============================================================================
@@ -236,6 +404,16 @@ function App() {
   const [lastClickTime, setLastClickTime] = useState(0);
   const [copySuccess, setCopySuccess] = useState(false);
   const [retryInfo, setRetryInfo] = useState(null);
+  const [loadingStage, setLoadingStage] = useState("");
+  const [usingCachedResult, setUsingCachedResult] = useState(false);
+  const [isSlowLoading, setIsSlowLoading] = useState(false);
+  const [analysisStats, setAnalysisStats] = useState(null);
+  const [showStats, setShowStats] = useState(false);
+  
+  // ✅ STREAMING: New state for streaming
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [currentStage, setCurrentStage] = useState(null);
+  const [stageProgress, setStageProgress] = useState({});
 
   const requestIdRef = useRef(null);
   const abortControllerRef = useRef(null);
@@ -294,6 +472,58 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!loading) {
+      setLoadingStage("");
+      setIsSlowLoading(false);
+      setCurrentStage(null);
+      return;
+    }
+
+    // Non-streaming loading stages
+    const steps = [
+      "📥 Reading reviews...",
+      "🧠 Understanding context...",
+      "📊 Analyzing patterns...",
+      "✨ Preparing results..."
+    ];
+
+    let i = 0;
+    setLoadingStage(steps[i]);
+    setIsSlowLoading(false);
+
+    const stageInterval = setInterval(() => {
+      i = (i + 1) % steps.length;
+      if (isMountedRef.current) {
+        setLoadingStage(steps[i]);
+      }
+    }, 1500);
+
+    const slowTimer = setTimeout(() => {
+      if (loading && isMountedRef.current && !isStreaming) {
+        setIsSlowLoading(true);
+      }
+    }, SLOW_LOADING_THRESHOLD);
+
+    return () => {
+      clearInterval(stageInterval);
+      clearTimeout(slowTimer);
+    };
+  }, [loading, isStreaming]);
+
+  useEffect(() => {
+    if (result) {
+      setTimeout(() => {
+        document.getElementById("result-section")?.scrollIntoView({
+          behavior: "smooth",
+          block: "start"
+        });
+        setShowStats(true);
+        setTimeout(() => setShowStats(false), 3000);
+      }, 100);
+    }
+  }, [result]);
+
   // ==============================================================================
   // HELPERS
   // ==============================================================================
@@ -305,13 +535,36 @@ function App() {
       .filter((line) => isMeaningfulReview(line));
   }, []);
 
-  const reviews = getCleanedReviews(inputText);
+  const reviewLines = useMemo(() => {
+    if (!inputText.trim()) return [];
+    const lines = inputText.split(/\n+/).map((line, idx) => 
+      analyzeReviewLine(line, idx)
+    );
+    return lines;
+  }, [inputText]);
+
+  const reviews = useMemo(() => getCleanedReviews(inputText), [inputText, getCleanedReviews]);
+  
+  const reviewStats = useMemo(() => {
+    const valid = reviewLines.filter(r => r.status === "valid").length;
+    const invalid = reviewLines.filter(r => r.status === "invalid").length;
+    const skipped = reviewLines.filter(r => r.status === "skipped").length;
+    return { total: reviewLines.length, valid, invalid, skipped };
+  }, [reviewLines]);
+  
   const safeResult = result ?? EMPTY_RESULT;
   const trimmedInput = inputText.trim();
   const isInputTooShort = trimmedInput.length > 0 && trimmedInput.length < MIN_REVIEW_INPUT_LENGTH;
   const hasMeaningfulResult = result ? hasMeaningfulInsights(result) : false;
   const isInCooldown = Date.now() - lastClickTime < COOLDOWN_MS;
   const isTruncated = reviews.length > MAX_REVIEWS_LIMIT;
+  
+  // ✅ STREAMING: Check if we have partial content to show
+  const hasPartialContent = result && (
+    result.summary || 
+    result.pros || 
+    result.cons
+  );
 
   const isAnalyzeDisabled = 
     loading || 
@@ -325,29 +578,9 @@ function App() {
   // ==============================================================================
 
   const copyToClipboard = () => {
-    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+    if (!navigator.clipboard) {
       log.warn("[Copy] Clipboard API not available");
-      const textArea = document.createElement("textarea");
-      textArea.value = JSON.stringify({
-        summary: safeResult.summary,
-        pros: safeResult.pros,
-        cons: safeResult.cons,
-        neutral_points: safeResult.neutral_points,
-        sentiment: safeResult.sentiment,
-        score: safeResult.score,
-        confidence: safeResult.confidence,
-        feature_scores: safeResult.feature_scores,
-      }, null, 2);
-      document.body.appendChild(textArea);
-      textArea.select();
-      try {
-        document.execCommand("copy");
-        setCopySuccess(true);
-        setTimeout(() => setCopySuccess(false), 2000);
-      } catch (err) {
-        log.error("[Copy] Fallback failed:", err);
-      }
-      document.body.removeChild(textArea);
+      setError("Copy not supported in this browser");
       return;
     }
 
@@ -360,6 +593,7 @@ function App() {
       score: safeResult.score,
       confidence: safeResult.confidence,
       feature_scores: safeResult.feature_scores,
+      analysisTime: analysisStats?.duration,
     }, null, 2);
 
     navigator.clipboard.writeText(textToCopy).then(() => {
@@ -367,8 +601,50 @@ function App() {
       setTimeout(() => setCopySuccess(false), 2000);
     }).catch((err) => {
       log.error("[Copy] Failed:", err);
+      setError("Failed to copy to clipboard");
     });
   };
+
+  const handleCancel = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      log.info("[Cancel] Request cancelled by user");
+    }
+  };
+
+  const handleInputChange = (e) => {
+    const value = e.target.value;
+    if (value.length > MAX_INPUT_LENGTH) {
+      setError(`Input too long. Maximum ${MAX_INPUT_LENGTH} characters allowed.`);
+      return;
+    }
+    setInputText(value);
+    if (error) setError("");
+    if (lowQualityMessage) setLowQualityMessage("");
+  };
+
+  // ✅ STREAMING: Handler for streaming chunks
+  const handleStreamChunk = useCallback((type, data) => {
+    setResult(prev => {
+      const current = prev || createPartialResult();
+      return updatePartialResult(current, type, data);
+    });
+    
+    // Update stage progress
+    setStageProgress(prev => ({
+      ...prev,
+      [type]: "complete"
+    }));
+  }, []);
+
+  // ✅ STREAMING: Handler for stage changes
+  const handleStreamStage = useCallback((stage, data) => {
+    setCurrentStage(stage);
+    setStageProgress(prev => ({
+      ...prev,
+      [stage.name]: "loading"
+    }));
+  }, []);
 
   const analyzeReviews = async () => {
     if (inFlightRef.current) return;
@@ -414,6 +690,7 @@ function App() {
       Date.now() - lastCacheTimeRef.current < CACHE_TTL
     ) {
       setError("");
+      setUsingCachedResult(false);
       if (hasMeaningfulInsights(lastResultRef.current)) {
         setLowQualityMessage("");
         setResult(lastResultRef.current);
@@ -430,20 +707,79 @@ function App() {
     setLoading(true);
     setError("");
     setLowQualityMessage("");
+    setUsingCachedResult(false);
     setRetryInfo({ retries: 0, maxRetries: MAX_RETRIES, status: "connecting" });
+    setShowStats(false);
+    setIsStreaming(false);
+    setCurrentStage(null);
+    setStageProgress({});
     inFlightRef.current = true;
+
+    const compressedReviews = compressReviews(limitedReviews);
+    const startTime = Date.now();
+    
+    const analysisTimerLabel = `analysis-${newRequestId}`;
+    console.time(analysisTimerLabel);
+    log.info(`[Analytics] Analysis started: ${newRequestId}`);
 
     const headers = { "Content-Type": "application/json" };
     if (API_KEY) headers["X-API-Key"] = API_KEY;
 
+    // Try streaming first, fall back to regular
     const fetchOptions = {
       method: "POST",
       headers,
-      body: JSON.stringify({ raw_text: limitedReviews.join("\n") }),
-      
+      body: JSON.stringify({ 
+        raw_text: compressedReviews.join("\n"),
+        reviews: compressedReviews,
+        domain: "auto"
+      }),
     };
 
     try {
+      // ✅ STREAMING: Try streaming endpoint first
+      let useStreaming = false;
+      
+      try {
+        const streamResult = await fetchWithStreaming(
+          ANALYZE_STREAM_URL,
+          fetchOptions,
+          handleStreamChunk,
+          handleStreamStage,
+          controller.signal,
+          newRequestId
+        );
+        
+        if (streamResult.success) {
+          useStreaming = true;
+          setIsStreaming(true);
+          const duration = Date.now() - startTime;
+          console.timeEnd(analysisTimerLabel);
+          
+          const stats = {
+            duration,
+            streaming: true,
+            reviewsAnalyzed: compressedReviews.length,
+          };
+          
+          setAnalysisStats(stats);
+          lastRequestKeyRef.current = requestKey;
+          lastResultRef.current = result;
+          lastCacheTimeRef.current = Date.now();
+          log.info(`[Analytics] ✅ Streaming completed:`, stats);
+          
+          setRetryInfo(null);
+          setLoading(false);
+          return;
+        }
+      } catch (streamError) {
+        log.warn("[Streaming] Fallback to regular request:", streamError.message);
+        // Fall through to regular request
+      }
+
+      // ✅ Regular (non-streaming) request as fallback
+      setIsStreaming(false);
+      
       const { response, retriesUsed } = await fetchWithRetry(
         ANALYZE_URL, fetchOptions, MAX_RETRIES, 0, newRequestId
       );
@@ -454,6 +790,7 @@ function App() {
         setError("Request was cancelled. Please try again.");
         setLoading(false);
         inFlightRef.current = false;
+        console.timeEnd(analysisTimerLabel);
         return;
       }
 
@@ -471,19 +808,29 @@ function App() {
       if (!response.ok) {
         const message = data?.detail || data?.message || `Server error (${response.status})`;
         let userMessage = message;
+        let errorType = "generic";
 
         if (response.status === 422) {
           userMessage = "⚠️ Invalid input format. Please enter proper reviews.";
-        } else if (message.toLowerCase().includes("no api keys")) {
-          userMessage = "🔑 Backend API keys not configured.";
+          errorType = "validation";
+        } else if (message.toLowerCase().includes("no api keys") || message.toLowerCase().includes("api key")) {
+          userMessage = "🔑 Backend API keys not configured. Please try again later.";
+          errorType = "config";
         } else if (message.toLowerCase().includes("gemini")) {
-          userMessage = "🤖 AI processing failed. Please try again.";
+          userMessage = "🤖 AI processing failed. Server may be busy — please try again.";
+          errorType = "ai";
         } else if (message.toLowerCase().includes("queue") && message.toLowerCase().includes("full")) {
-          userMessage = "⚠️ Server is busy. Please try again.";
+          userMessage = "⚠️ Server queue is full. Please wait and try again.";
+          errorType = "queue";
+        } else if (response.status === 429) {
+          userMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
+          errorType = "rate_limit";
         } else if (response.status >= 500) {
-          userMessage = "🛠️ Server error. Please try again.";
+          userMessage = "🛠️ Server error. The team has been notified.";
+          errorType = "server";
         }
 
+        log.error(`[Error:${errorType}] ${message}`);
         throw new Error(userMessage);
       }
 
@@ -495,6 +842,22 @@ function App() {
       lastRequestKeyRef.current = requestKey;
       lastResultRef.current = normalizedData;
       lastCacheTimeRef.current = Date.now();
+
+      const endTime = Date.now();
+      const duration = endTime - startTime;
+      console.timeEnd(analysisTimerLabel);
+      
+      const stats = {
+        duration,
+        retriesUsed,
+        reviewsAnalyzed: compressedReviews.length,
+        responseSize: responseText.length,
+        cached: false,
+        streaming: false,
+      };
+      
+      setAnalysisStats(stats);
+      log.info(`[Analytics] ✅ Analysis completed:`, stats);
 
       if (hasMeaningfulInsights(normalizedData)) {
         setLowQualityMessage("");
@@ -509,31 +872,54 @@ function App() {
         setError("Request was cancelled. Please try again.");
         setLoading(false);
         inFlightRef.current = false;
+        console.timeEnd(analysisTimerLabel);
         return;
       }
 
       let errorMessage;
+      let errorType = "network";
       const errorText = requestError.message || String(requestError);
 
-      if (requestError.isTimeout || errorText.includes("timed out")) {
-        errorMessage = "⏱️ Request timed out. Please try again.";
+      if (requestError.isTimeout || errorText.includes("timed out") || errorText.includes("timeout")) {
+        errorMessage = "⏱️ AI is taking longer than usual. Please try again or reduce the number of reviews.";
+        errorType = "timeout";
       } else if (
         errorText.includes("Failed to fetch") ||
         errorText.includes("NetworkError") ||
-        errorText.includes("fetch failed")
+        errorText.includes("fetch failed") ||
+        errorText.includes("network")
       ) {
-        errorMessage = "🔌 Network error. Please try again.";
+        errorMessage = "🔌 Network issue detected. Please check your connection and try again.";
+        errorType = "network";
       } else if (errorText.includes("429")) {
-        errorMessage = "⚠️ API rate limit reached.";
+        errorMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
+        errorType = "rate_limit";
+      } else if (errorText.includes("CORS") || errorText.includes("cors")) {
+        errorMessage = "🌐 CORS error. Please try again from a different browser.";
+        errorType = "cors";
       } else {
-        errorMessage = errorText || "Something went wrong.";
+        errorMessage = errorText || "Something went wrong. Please try again.";
+        errorType = "unknown";
       }
 
-      setError(errorMessage);
-      setRetryInfo(null);
+      log.error(`[Error:${errorType}] ${errorText}`);
+
+      if (lastResultRef.current && hasMeaningfulInsights(lastResultRef.current)) {
+        log.warn("[Fallback] Using cached result due to error:", errorType);
+        setError("");
+        setUsingCachedResult(true);
+        setLowQualityMessage("");
+        setResult(lastResultRef.current);
+        setRetryInfo(null);
+      } else {
+        setError(errorMessage);
+        setRetryInfo(null);
+      }
     } finally {
       if (isMountedRef.current) {
         setLoading(false);
+        setIsStreaming(false);
+        setCurrentStage(null);
         inFlightRef.current = false;
         abortControllerRef.current = null;
       }
@@ -550,21 +936,30 @@ function App() {
   // ==============================================================================
 
   const renderList = (items, emptyMessage) => {
-    const values = items.length > 0 ? items : [emptyMessage];
+    const values = items && items.length > 0 ? items : [emptyMessage];
     return (
       <ul className="mt-4 space-y-3 text-sm leading-6 text-slate-100">
-        {values.map((item, index) => (
-          <li key={`item-${index}`} className="rounded-2xl bg-black/10 px-4 py-3">
-            {item}
-          </li>
-        ))}
+        {values.map((item, index) => {
+          const text = typeof item === "string" ? item : item.text;
+          const feature = typeof item === "object" && item?.feature ? item.feature : null;
+          
+          return (
+            <li key={`item-${index}`} className="rounded-2xl bg-black/10 px-4 py-3">
+              {text}
+              {feature && (
+                <span className="ml-2 text-xs text-slate-400">
+                  ({feature})
+                </span>
+              )}
+            </li>
+          );
+        })}
       </ul>
     );
   };
 
-  // ✅ FIXED: Feature score with safe number handling
   const renderFeatureScore = (feature, score, maxScore = 5) => {
-    const safeScore = toSafeNumber(score); // ✅ SAFE: Handles null, undefined, NaN
+    const safeScore = toSafeNumber(score);
     const percentage = Math.min((safeScore / maxScore) * 100, 100);
     
     const getScoreColor = (s) => {
@@ -574,10 +969,10 @@ function App() {
     };
 
     return (
-      <div key={feature} className="mt-3">
+      <div className="mt-3">
         <div className="flex justify-between text-sm mb-1">
           <span className="text-slate-200 capitalize">
-            {feature.replace(/_/g, " ") || "Unknown feature"}
+            {(feature || "").replace(/_/g, " ") || "Unknown feature"}
           </span>
           <span className="text-slate-300 font-medium">
             {safeScore.toFixed(1)}/{maxScore}
@@ -623,6 +1018,89 @@ function App() {
     </section>
   );
 
+  // ✅ STREAMING: Progressive loading indicator
+  const renderStreamingProgress = () => (
+    <section className="rounded-[2rem] border border-emerald-400/20 bg-[rgba(7,23,19,0.72)] p-6 sm:p-8">
+      <div className="mb-6">
+        <h2 className="text-2xl font-semibold text-white flex items-center gap-3">
+          <span className="animate-pulse">🔄</span>
+          Streaming Results
+        </h2>
+        <p className="mt-1 text-sm text-emerald-300/80">
+          Processing in real-time...
+        </p>
+      </div>
+
+      {/* Stage Progress */}
+      <div className="space-y-3 mb-8">
+        {Object.values(STREAM_STAGES).filter(s => s.name !== "complete").map((stage) => {
+          const status = stageProgress[stage.name] || "pending";
+          const isActive = currentStage?.name === stage.name;
+          
+          return (
+            <div 
+              key={stage.name}
+              className={`flex items-center gap-3 p-3 rounded-xl transition-all ${
+                isActive ? "bg-emerald-400/10 border border-emerald-400/30" : "bg-white/5"
+              }`}
+            >
+              <span className="text-xl">
+                {status === "complete" ? "✅" : isActive ? stage.icon : "⏳"}
+              </span>
+              <div className="flex-1">
+                <p className={`text-sm font-medium ${
+                  status === "complete" ? "text-emerald-300" : isActive ? "text-white" : "text-slate-400"
+                }`}>
+                  {stage.label}
+                </p>
+                {isActive && (
+                  <div className="mt-1 h-1 rounded-full bg-emerald-400/30 overflow-hidden">
+                    <div className="h-full w-1/2 bg-emerald-400 animate-pulse rounded-full" />
+                  </div>
+                )}
+              </div>
+              <span className={`text-xs ${
+                status === "complete" ? "text-emerald-400" : isActive ? "text-amber-300" : "text-slate-500"
+              }`}>
+                {status === "complete" ? "Done" : isActive ? "Loading..." : "Waiting"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Partial Results Preview */}
+      {(result?.summary || result?.pros || result?.cons) && (
+        <div className="space-y-4">
+          <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
+            Partial Results (more coming...)
+          </h3>
+          
+          {result?.summary && (
+            <div className="rounded-xl border border-white/10 bg-slate-950/35 p-4">
+              <p className="text-xs uppercase tracking-wider text-emerald-200/80 mb-2">Summary</p>
+              <p className="text-sm text-slate-100">{result.summary}</p>
+            </div>
+          )}
+          
+          {result?.pros && result.pros.length > 0 && (
+            <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/8 p-4">
+              <p className="text-xs uppercase tracking-wider text-emerald-100 mb-2">Pros (preliminary)</p>
+              {renderList(result.pros.slice(0, 2), "Loading...")}
+            </div>
+          )}
+          
+          {result?.cons && result.cons.length > 0 && (
+            <div className="rounded-xl border border-rose-300/15 bg-rose-300/8 p-4">
+              <p className="text-xs uppercase tracking-wider text-rose-100 mb-2">Cons (preliminary)</p>
+              {renderList(result.cons.slice(0, 2), "Loading...")}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+
   // ==============================================================================
   // RENDER
   // ==============================================================================
@@ -660,7 +1138,7 @@ function App() {
                 </div>
               </div>
 
-              <h1 className="text-4xl font-bold tracking-tight text-white sm:text-5xl">
+              <h1 className="text-3xl sm:text-4xl lg:text-5xl font-bold tracking-tight text-white">
                 AI Product Review Analyzer
               </h1>
               <p className="mt-3 max-w-2xl text-sm text-slate-300/80 sm:text-base">
@@ -672,6 +1150,18 @@ function App() {
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-3 text-sm font-medium text-slate-200">
                     <span>Enter Reviews</span>
                     <div className="flex items-center gap-3">
+                      {reviewStats.total > 0 && (
+                        <div className="flex items-center gap-2">
+                          <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-xs text-emerald-300">
+                            ✓ {reviewStats.valid}
+                          </span>
+                          {reviewStats.invalid > 0 && (
+                            <span className="rounded-full border border-rose-400/30 bg-rose-400/10 px-2 py-0.5 text-xs text-rose-300">
+                              ✗ {reviewStats.invalid}
+                            </span>
+                          )}
+                        </div>
+                      )}
                       <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
                         {reviews.length} entry{reviews.length === 1 ? "" : "s"}
                       </span>
@@ -683,20 +1173,45 @@ function App() {
                     </div>
                   </div>
 
-                  <textarea
-                    value={inputText}
-                    onChange={(event) => {
-                      setInputText(event.target.value);
-                      if (error) setError("");
-                      if (lowQualityMessage) setLowQualityMessage("");
-                    }}
-                    placeholder={`Battery life is excellent and setup was simple.\nThe camera is average for the price.\nPerformance feels slow sometimes.\n\nSeparate reviews with newlines!`}
-                    className="min-h-64 w-full rounded-3xl border border-white/10 bg-slate-950/55 px-5 py-4 text-base text-slate-100 outline-none transition focus:border-emerald-300/60 focus:ring-2 focus:ring-emerald-300/20"
-                    disabled={loading}
-                  />
-                  <p className="mt-3 text-xs text-slate-400">
-                    Separate reviews with newlines. Each review must be at least 10 characters with letters.
-                  </p>
+                  <div className="relative">
+                    <textarea
+                      value={inputText}
+                      onChange={handleInputChange}
+                      placeholder={`Battery life is excellent and setup was simple.\nThe camera is average for the price.\nPerformance feels slow sometimes.\n\nSeparate reviews with newlines!`}
+                      className="min-h-48 sm:min-h-64 w-full rounded-3xl border border-white/10 bg-slate-950/55 px-4 sm:px-5 py-3 sm:py-4 text-base text-slate-100 outline-none transition focus:border-emerald-300/60 focus:ring-2 focus:ring-emerald-300/20 resize-y"
+                      disabled={loading}
+                      rows={6}
+                    />
+                    
+                    {reviewLines.length > 0 && reviewLines.some(r => r.status !== "skipped") && (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {reviewLines.map((review, idx) => (
+                          <span 
+                            key={idx}
+                            className={`text-xs px-2 py-0.5 rounded-full ${
+                              review.status === "valid" 
+                                ? "bg-emerald-400/20 text-emerald-300" 
+                                : review.status === "invalid"
+                                ? "bg-rose-400/20 text-rose-300"
+                                : "bg-slate-400/10 text-slate-500"
+                            }`}
+                            title={review.trimmed || "(empty)"}
+                          >
+                            {idx + 1}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                    <span>
+                      Separate reviews with newlines. Each review must be at least 10 characters with letters.
+                    </span>
+                    <span className="text-slate-500">
+                      {inputText.length}/{MAX_INPUT_LENGTH}
+                    </span>
+                  </div>
                 </label>
 
                 {isTruncated && (
@@ -708,7 +1223,7 @@ function App() {
 
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex flex-col gap-1">
-                    <div className="text-xs text-slate-500">
+                    <div className="text-xs text-slate-500 hidden sm:block">
                       API: {API_BASE_URL.replace(/^https?:\/\//, "")}
                     </div>
                     {isInCooldown && !error && (
@@ -722,26 +1237,54 @@ function App() {
                         ✅ Recovered after {retryInfo.retries} retry{retryInfo.retries !== 1 ? "s" : ""}
                       </div>
                     )}
+                    {isSlowLoading && (
+                      <div className="text-xs text-amber-300 animate-pulse">
+                        ⏱️ Taking longer than usual...
+                      </div>
+                    )}
+                    {showStats && analysisStats && (
+                      <div className="text-xs text-cyan-300 animate-pulse">
+                        ⚡ Completed in {analysisStats.duration}ms
+                      </div>
+                    )}
                   </div>
 
-                  <button
-                    type="submit"
-                    disabled={isAnalyzeDisabled}
-                    className="inline-flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-amber-300 px-6 py-3 text-sm font-semibold text-slate-950 shadow-[0_14px_40px_rgba(52,211,153,0.28)] transition duration-300 hover:-translate-y-0.5 hover:scale-105 disabled:cursor-not-allowed disabled:opacity-70"
-                  >
-                    {loading ? (
-                      <span className="flex items-center gap-2">
-                        <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                        </svg>
-                        {retryInfo?.status === "retried" ? "Recovered ✓" :
-                         retryInfo ? `Retrying (${retryInfo.retries}/${retryInfo.maxRetries})...` : "Analyzing (may take 10-15s)..."}
-                      </span>
-                    ) : (
-                      "Analyze Reviews"
+                  <div className="flex flex-col items-start sm:items-end gap-2">
+                    <button
+                      type="submit"
+                      disabled={isAnalyzeDisabled}
+                      className="w-full sm:w-auto inline-flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-amber-300 px-6 py-3 text-sm font-semibold text-slate-950 shadow-[0_14px_40px_rgba(52,211,153,0.28)] transition duration-300 hover:-translate-y-0.5 hover:scale-105 disabled:cursor-not-allowed disabled:opacity-70"
+                    >
+                      {loading ? (
+                        <span className="flex items-center gap-2">
+                          <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                          </svg>
+                          {isStreaming ? (
+                            <span className="flex items-center gap-2">
+                              🔄 Streaming... 
+                              {currentStage?.icon} {currentStage?.label}
+                            </span>
+                          ) : (
+                            loadingStage || "Analyzing..."
+                          )}
+                        </span>
+                      ) : (
+                        "Analyze Reviews"
+                      )}
+                    </button>
+                    
+                    {loading && (
+                      <button
+                        type="button"
+                        onClick={handleCancel}
+                        className="text-xs text-rose-400 hover:text-rose-300 hover:underline transition-colors"
+                      >
+                        Cancel request
+                      </button>
                     )}
-                  </button>
+                  </div>
                 </div>
               </form>
 
@@ -776,18 +1319,54 @@ function App() {
           </div>
         </section>
 
-        {loading && renderSkeleton()}
+        {/* ✅ STREAMING: Show streaming progress when active */}
+        {loading && isStreaming && renderStreamingProgress()}
+        
+        {/* Regular skeleton for non-streaming */}
+        {loading && !isStreaming && renderSkeleton()}
+
+        {!result && !loading && (
+          <div className="text-center text-slate-400 py-12 sm:py-16 rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)]">
+            <div className="text-4xl sm:text-5xl mb-4">🧠</div>
+            <p className="text-base sm:text-lg text-slate-200">Start analyzing product reviews</p>
+            <p className="text-sm mt-3 text-slate-500">
+              Paste multiple reviews separated by new lines
+            </p>
+          </div>
+        )}
 
         {result && hasMeaningfulResult && !isInputTooShort && !lowQualityMessage && !loading && (
-          <section className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-6 sm:p-8">
-            <div className="mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <section id="result-section" className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-4 sm:p-6 lg:p-8">
+            <div className="mb-6 sm:mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <h2 className="text-2xl font-semibold text-white">Analysis Result</h2>
-                <p className="mt-1 text-sm text-slate-300">Response from the FastAPI backend.</p>
+                <h2 className="text-xl sm:text-2xl font-semibold text-white">Analysis Result</h2>
+                <p className="mt-1 text-sm text-slate-300">
+                  Response from the FastAPI backend.
+                  {usingCachedResult && (
+                    <span className="ml-2 text-xs text-amber-400">(using previous result)</span>
+                  )}
+                </p>
+                
+                {analysisStats && (
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                    <span className="flex items-center gap-1">
+                      ⚡ {analysisStats.duration}ms
+                      {analysisStats.streaming && <span className="text-emerald-400">[Streaming]</span>}
+                    </span>
+                    <span>•</span>
+                    <span>{analysisStats.reviewsAnalyzed} reviews</span>
+                    {analysisStats.retriesUsed > 0 && (
+                      <>
+                        <span>•</span>
+                        <span className="text-amber-400">{analysisStats.retriesUsed} retries</span>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
               <button
                 onClick={copyToClipboard}
-                className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition ${
+                className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition ${
                   copySuccess ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20"
                 }`}
               >
@@ -809,89 +1388,98 @@ function App() {
               </button>
             </div>
 
-            <div className="mb-6 flex flex-wrap gap-3">
-              <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
-                <span className="block text-slate-400">Total Reviews</span>
+            <div className="mb-6 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
+              <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
+                <span className="block text-slate-400 text-xs">Reviews</span>
                 <span className="font-semibold text-slate-100">{safeResult.sentiment.total || reviews.length}</span>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
-                <span className="block text-slate-400">Score</span>
+              <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
+                <span className="block text-slate-400 text-xs">Score</span>
                 <span className="font-semibold text-amber-100">{formatScore(safeResult.score)}</span>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
-                <span className="block text-slate-400">Confidence</span>
+              <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
+                <span className="block text-slate-400 text-xs">Confidence</span>
                 <span className="font-semibold text-cyan-200">{formatPercent(safeResult.confidence)}</span>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
-                <span className="block text-slate-400">Positive</span>
+              <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
+                <span className="block text-slate-400 text-xs">Positive</span>
                 <span className="font-semibold text-emerald-300">{formatPercent(safeResult.sentiment.positive)}</span>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
-                <span className="block text-slate-400">Neutral</span>
+              <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
+                <span className="block text-slate-400 text-xs">Neutral</span>
                 <span className="font-semibold text-amber-200">{formatPercent(safeResult.sentiment.neutral)}</span>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
-                <span className="block text-slate-400">Negative</span>
+              <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
+                <span className="block text-slate-400 text-xs">Negative</span>
                 <span className="font-semibold text-rose-300">{formatPercent(safeResult.sentiment.negative)}</span>
               </div>
             </div>
 
             <div className="grid gap-6 lg:grid-cols-[1fr_0.95fr]">
-              <div className="space-y-6">
-                <article className="rounded-[1.5rem] border border-white/10 bg-slate-950/35 p-5">
-                  <p className="text-sm uppercase tracking-[0.18em] text-emerald-200/80">Summary</p>
-                  <p className="mt-3 text-base leading-7 text-slate-100">{safeResult.summary}</p>
+              <div className="space-y-4 sm:space-y-6">
+                <article className="rounded-xl sm:rounded-[1.5rem] border border-white/10 bg-slate-950/35 p-4 sm:p-5">
+                  <p className="text-xs sm:text-sm uppercase tracking-[0.18em] text-emerald-200/80">Summary</p>
+                  <p className="mt-2 sm:mt-3 text-sm sm:text-base leading-6 sm:leading-7 text-slate-100">{safeResult.summary}</p>
                 </article>
 
-                <div className="grid gap-6 md:grid-cols-2">
-                  <article className="rounded-[1.5rem] border border-emerald-300/15 bg-emerald-300/8 p-5">
-                    <p className="text-sm uppercase tracking-[0.18em] text-emerald-100">Pros</p>
+                <div className="grid gap-4 sm:gap-6 md:grid-cols-2">
+                  <article className="rounded-xl sm:rounded-[1.5rem] border border-emerald-300/15 bg-emerald-300/8 p-4 sm:p-5">
+                    <p className="text-xs sm:text-sm uppercase tracking-[0.18em] text-emerald-100">Pros</p>
                     {renderList(safeResult.pros, "No pros returned.")}
                   </article>
-                  <article className="rounded-[1.5rem] border border-rose-300/15 bg-rose-300/8 p-5">
-                    <p className="text-sm uppercase tracking-[0.18em] text-rose-100">Cons</p>
+                  <article className="rounded-xl sm:rounded-[1.5rem] border border-rose-300/15 bg-rose-300/8 p-4 sm:p-5">
+                    <p className="text-xs sm:text-sm uppercase tracking-[0.18em] text-rose-100">Cons</p>
                     {renderList(safeResult.cons, "No cons returned.")}
                   </article>
                 </div>
 
-                <article className="rounded-[1.5rem] border border-amber-300/15 bg-amber-300/8 p-5">
-                  <p className="text-sm uppercase tracking-[0.18em] text-amber-100">Neutral Points</p>
+                <article className="rounded-xl sm:rounded-[1.5rem] border border-amber-300/15 bg-amber-300/8 p-4 sm:p-5">
+                  <p className="text-xs sm:text-sm uppercase tracking-[0.18em] text-amber-100">Neutral Points</p>
                   {renderList(safeResult.neutral_points, "No neutral feedback found.")}
                 </article>
 
-                {/* ✅ FIXED: Feature Scores with safe extraction */}
                 {safeResult.feature_scores && safeResult.feature_scores.length > 0 && (
-                  <article className="rounded-[1.5rem] border border-cyan-300/15 bg-cyan-300/8 p-5">
-                    <p className="text-sm uppercase tracking-[0.18em] text-cyan-100">Feature Scores</p>
+                  <article className="rounded-xl sm:rounded-[1.5rem] border border-cyan-300/15 bg-cyan-300/8 p-4 sm:p-5">
+                    <p className="text-xs sm:text-sm uppercase tracking-[0.18em] text-cyan-100">Feature Scores</p>
                     <div className="space-y-1">
-                      {safeResult.feature_scores.map((featureScore, index) => {
-                        const { feature, score } = extractFeatureScore(featureScore);
-                        return renderFeatureScore(feature, score);
-                      })}
+                      {safeResult.feature_scores
+                        .filter(isValidFeatureScore)
+                        .map((featureScore, index) => {
+                          const { feature, score } = extractFeatureScore(featureScore);
+                          return (
+                            <div key={`feature-${index}`}>
+                              {renderFeatureScore(feature, score)}
+                            </div>
+                          );
+                        })}
                     </div>
                   </article>
                 )}
               </div>
 
-              <div>
-                <p className="mb-4 text-sm uppercase tracking-[0.18em] text-amber-100/80">Sentiment Chart</p>
-                {safeResult.sentiment.total > 0 ? (
-                  <SentimentChart
-                    positive={safeResult.sentiment.positive}
-                    neutral={safeResult.sentiment.neutral}
-                    negative={safeResult.sentiment.negative}
-                    score={safeResult.score}
-                    confidence={safeResult.confidence}
-                  />
-                ) : (
-                  renderEmptyChart()
-                )}
+              <div className="mt-6 lg:mt-0">
+                <p className="mb-4 text-xs sm:text-sm uppercase tracking-[0.18em] text-amber-100/80">Sentiment Chart</p>
+                <div className="w-full overflow-hidden rounded-2xl border border-white/10 bg-slate-950/20">
+                  {safeResult.sentiment.total > 0 ? (
+                    <div className="w-full">
+                      <SentimentChart
+                        positive={safeResult.sentiment.positive}
+                        neutral={safeResult.sentiment.neutral}
+                        negative={safeResult.sentiment.negative}
+                        score={safeResult.score}
+                        confidence={safeResult.confidence}
+                      />
+                    </div>
+                  ) : (
+                    renderEmptyChart()
+                  )}
+                </div>
               </div>
             </div>
           </section>
         )}
 
-        <footer className="mt-10 text-center text-sm text-slate-400/80">
+        <footer className="mt-10 text-center text-xs sm:text-sm text-slate-400/80">
           Developed by Babul Kumar • Ultra-resilient with auto-retry + timeout
         </footer>
       </div>
