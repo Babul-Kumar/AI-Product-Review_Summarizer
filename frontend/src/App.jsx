@@ -31,7 +31,7 @@ const LOW_QUALITY_MESSAGE = "Please enter meaningful product reviews to get accu
 const COOLDOWN_MS = 3000;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_BASE = 1500;
-const REQUEST_TIMEOUT_MS = 10000;
+const REQUEST_TIMEOUT_MS = 40000;
 const HEALTH_CHECK_INTERVAL = 30000;
 const MAX_REVIEWS_LIMIT = 30;
 const CACHE_TTL = 60000;
@@ -169,7 +169,9 @@ function extractFeatureScore(featureScore) {
 
 function fetchWithTimeout(url, options, timeout = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeout);
 
   return fetch(url, {
     ...options,
@@ -438,7 +440,7 @@ function App() {
       method: "POST",
       headers,
       body: JSON.stringify({ raw_text: limitedReviews.join("\n") }),
-      signal: controller.signal,
+      
     };
 
     try {
@@ -734,7 +736,7 @@ function App() {
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                         </svg>
                         {retryInfo?.status === "retried" ? "Recovered ✓" :
-                         retryInfo ? `Retrying (${retryInfo.retries}/${retryInfo.maxRetries})...` : "Analyzing..."}
+                         retryInfo ? `Retrying (${retryInfo.retries}/${retryInfo.maxRetries})...` : "Analyzing (may take 10-15s)..."}
                       </span>
                     ) : (
                       "Analyze Reviews"
