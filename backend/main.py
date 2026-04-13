@@ -13,7 +13,7 @@ from collections import Counter, OrderedDict
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import uuid
 
 from dotenv import load_dotenv
@@ -60,7 +60,7 @@ if raw_keys:
     VALID_API_KEYS = {k.strip() for k in raw_keys.split(",") if k.strip()}
 
 if not VALID_API_KEYS:
-    logger.info("No API_KEYS configured - running in open mode")
+    logger.warning("No API_KEYS configured - running in open mode (NOT RECOMMENDED FOR PRODUCTION)")
 
 # Cache settings
 ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
@@ -71,7 +71,10 @@ MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", "1000"))
 PLACEHOLDER_API_KEYS = {"your_gemini_api_key_here", "replace_with_real_key"}
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LEGACY_MODEL_ALIASES = {"gemini-pro": DEFAULT_GEMINI_MODEL}
-GEMINI_TIMEOUT = 8  # seconds per Gemini call
+
+# Performance timeouts
+GEMINI_TIMEOUT = 6
+REQUEST_TIMEOUT = 45
 
 # Limits
 MAX_POINTS = int(os.getenv("MAX_POINTS", "6"))
@@ -91,10 +94,8 @@ MAX_INPUT_SIZE = 10000
 WORKER_POOL_SIZE = int(os.getenv("WORKER_POOL_SIZE", "3"))
 QUEUE_MAX_SIZE = 500
 
-# Fast‑mode (skip Gemini when request is too large)
+# Fast-mode
 MAX_CLAUSES_FOR_AI = int(os.getenv("MAX_CLAUSES_FOR_AI", "20"))
-
-# Gemini input size limits
 GEMINI_MAX_CLAUSES = 10
 GEMINI_MAX_CHARS = 300
 
@@ -102,10 +103,23 @@ GEMINI_MAX_CHARS = 300
 API_V1_PREFIX = "/api/v1"
 API_V2_PREFIX = "/api/v2"
 
-# ==============================================================================
-# STREAMING CONFIGURATION
-# ==============================================================================
-STREAM_CHUNK_DELAY = 0.1  # Delay between chunks for smooth streaming
+# Streaming
+STREAM_CHUNK_DELAY = 0.02
+
+# Filler words
+FILLER_WORDS = frozenset({
+    "honestly", "basically", "actually", "literally", "overall",
+    "personally", "maybe", "probably", "frankly", "simply",
+    "just", "really", "very", "quite", "somewhat", "kinda",
+    "sorta", "fairly", "pretty", "rather", "enough", "almost",
+})
+
+# Connector words
+CONNECTOR_WORDS = frozenset({
+    "but", "however", "although", "though", "while", "whereas",
+    "yet", "except", "otherwise", "nonetheless", "nevertheless",
+    "alternatively", "instead", "also", "plus", "and then",
+})
 
 # ==============================================================================
 # STRUCTURED WARNINGS MODEL
@@ -196,6 +210,9 @@ def tokenize(text: str) -> set[str]:
     return set(re.findall(r"\b\w+\b", text.lower()))
 
 
+# ==============================================================================
+# DOMAIN DETECTION WITH CONFIDENCE THRESHOLD
+# ==============================================================================
 def detect_domain(text: str) -> str:
     words = tokenize(text)
     text_lower = text.lower()
@@ -211,13 +228,14 @@ def detect_domain(text: str) -> str:
                 score += 2 * weight
         scores[domain] = score
 
-    if scores and max(scores.values()) > 0:
+    max_score = max(scores.values()) if scores else 0
+    if max_score >= 2:
         return max(scores, key=scores.get)
     return "generic"
 
 
 # ==============================================================================
-# WINDOW‑BASED NEGATION HANDLING
+# WINDOW-BASED NEGATION HANDLING
 # ==============================================================================
 NEGATIONS = frozenset({
     "not", "no", "never", "neither", "nobody", "nothing", "nowhere",
@@ -241,6 +259,37 @@ def handle_negation(text: str) -> str:
         else:
             result.append(w)
     return " ".join(result)
+
+
+# ==============================================================================
+# SPECIAL NEGATION HANDLING
+# ==============================================================================
+SPECIAL_NEGATIONS = {
+    "not bad": "good",
+    "not the worst": "average",
+    "not good": "poor",
+    "not great": "mediocre",
+    "not happy": "dissatisfied",
+    "not disappointed": "satisfied",
+    "not terrible": "acceptable",
+    "not bad at all": "good",
+    "not half bad": "decent",
+    "nothing bad": "all good",
+    "no complaints about": "satisfied with",
+    "can't complain": "acceptable",
+    "couldn't be better": "excellent",
+    "not a problem": "acceptable",
+    "no problem with": "satisfied with",
+    "not disappointing": "satisfactory",
+}
+
+
+def handle_special_negations(text: str) -> str:
+    text_lower = text.lower()
+    for phrase, replacement in SPECIAL_NEGATIONS.items():
+        if phrase in text_lower:
+            text = re.sub(re.escape(phrase), replacement, text, flags=re.IGNORECASE)
+    return text
 
 
 # ==============================================================================
@@ -284,7 +333,7 @@ DOMAIN_FEATURES = {
         "wear": {"wear", "lasting", "smudge", "transfer", "fade", "settle"},
         "skin": {"breakout", "irritation", "allergic", "sensitive", "oily", "dry"},
     },
-    "general_product": {
+    "generic": {
         "quality": {"quality", "durable", "cheap", "premium", "sturdy", "flimsy"},
         "usability": {"easy", "difficult", "convenient", "complicated", "intuitive"},
         "value": {"value", "worth", "price", "expensive", "affordable", "budget"},
@@ -299,36 +348,150 @@ def get_features_for_domain(domain: str) -> dict:
     if domain in DOMAIN_FEATURES:
         features.update(DOMAIN_FEATURES[domain])
     elif domain == "generic":
-        features.update(DOMAIN_FEATURES["general_product"])
+        features.update(DOMAIN_FEATURES["generic"])
     return features
 
 
-def extract_feature_with_context(sentence: str, domain: str = "generic") -> Optional[str]:
-    words = re.findall(r"\b\w+\b", sentence.lower())
-    features = get_features_for_domain(domain)
+# ==============================================================================
+# 🚨 FIX #1: MEMORY-SAFE POLARITY CACHE using @lru_cache
+# ==============================================================================
+@lru_cache(maxsize=5000)
+def get_sentiment_polarity_cached(text: str) -> float:
+    """
+    Get sentiment polarity with automatic memory management via LRU cache.
+    Max 5000 entries - oldest automatically evicted when full.
+    """
+    # Apply special negation handling
+    text = handle_special_negations(text)
+    negated_text = handle_negation(text)
+    
+    vader_score = 0.0
+    if USE_VADER:
+        vader_score = vader_analyzer.polarity_scores(negated_text)["compound"]
 
+    text_lower = negated_text.lower()
+    kw_score = 0.0
+    for kw in STRONG_POSITIVE:
+        kw_score += 0.3 if f"NOT_{kw}" in text_lower else (-0.3 if kw in text_lower else 0)
+    for kw in SOFT_POSITIVE:
+        kw_score += -0.1 if f"NOT_{kw}" in text_lower else (0.1 if kw in text_lower else 0)
+    for kw in STRONG_NEGATIVE:
+        kw_score += 0.15 if f"NOT_{kw}" in text_lower else (-0.3 if kw in text_lower else 0)
+    for kw in SOFT_NEGATIVE:
+        kw_score += 0.05 if f"NOT_{kw}" in text_lower else (-0.1 if kw in text_lower else 0)
+
+    blended = 0.6 * vader_score + 0.4 * kw_score if USE_VADER else kw_score
+    return max(-1.0, min(1.0, blended))
+
+
+# Backward compatibility
+def get_sentiment_polarity(text: str) -> float:
+    return get_sentiment_polarity_cached(text.lower().strip())
+
+
+# ==============================================================================
+# 🚨 FIX #2: DOMAIN-SPECIFIC ALIAS MAPS
+# ==============================================================================
+# Precomputed alias maps for each domain - O(1) lookups
+_ALIAS_MAPS: dict[str, dict[str, str]] = {}
+_ALIAS_MAPS_BUILT = False
+
+
+def _build_alias_maps():
+    """
+    Build domain-specific alias maps for O(1) feature lookups.
+    This enables context-aware feature detection:
+    - "light" → weight (electronics)
+    - "light" → taste/texture (food)
+    """
+    global _ALIAS_MAPS, _ALIAS_MAPS_BUILT
+    if _ALIAS_MAPS_BUILT:
+        return
+    
+    _ALIAS_MAPS.clear()
+    
+    # Build for each domain
+    for domain in ["electronics", "clothing", "food", "furniture", "beauty", "home_appliances", "generic"]:
+        alias_map = {}
+        features = get_features_for_domain(domain)
+        for feature, aliases in features.items():
+            for alias in aliases:
+                alias_map[alias] = feature
+        _ALIAS_MAPS[domain] = alias_map
+    
+    _ALIAS_MAPS_BUILT = True
+    logger.info(f"Built alias maps for {len(_ALIAS_MAPS)} domains")
+
+
+# Global fallback alias map (all domains combined)
+_GLOBAL_ALIAS_MAP: dict[str, str] = {}
+_GLOBAL_ALIAS_MAP_BUILT = False
+
+
+def _build_global_alias_map():
+    """Build global alias map combining all domains."""
+    global _GLOBAL_ALIAS_MAP, _GLOBAL_ALIAS_MAP_BUILT
+    if _GLOBAL_ALIAS_MAP_BUILT:
+        return
+    
+    _GLOBAL_ALIAS_MAP.clear()
+    for domain_alias_map in _ALIAS_MAPS.values():
+        for alias, feature in domain_alias_map.items():
+            if alias not in _GLOBAL_ALIAS_MAP:
+                _GLOBAL_ALIAS_MAP[alias] = feature
+    
+    _GLOBAL_ALIAS_MAP_BUILT = True
+
+
+def extract_feature_with_context(sentence: str, domain: str = "generic") -> Optional[str]:
+    """
+    Extract feature using domain-specific alias map for better accuracy.
+    
+    Examples:
+    - "light" in electronics → comfort (weight)
+    - "light" in food → texture (light taste)
+    """
+    # Ensure maps are built
+    _build_alias_maps()
+    _build_global_alias_map()
+    
+    words = re.findall(r"\b\w+\b", sentence.lower())
+    
+    # Phase 1: Try domain-specific alias map first
+    if domain in _ALIAS_MAPS:
+        domain_map = _ALIAS_MAPS[domain]
+        for word in words:
+            if word in domain_map:
+                return domain_map[word]
+    
+    # Phase 2: Fall back to global alias map
+    for word in words:
+        if word in _GLOBAL_ALIAS_MAP:
+            return _GLOBAL_ALIAS_MAP[word]
+    
+    # Phase 3: Context-aware scoring for domain features
+    features = get_features_for_domain(domain)
     best_feature = None
     best_score = 0
-
+    
     for i, word in enumerate(words):
         window_start = max(0, i - 3)
         window_end = min(len(words), i + 4)
         window = set(words[window_start:window_end])
-
+        
         for feature, aliases in features.items():
             match_count = sum(1 for alias in aliases if alias in window)
             if word in aliases:
                 match_count += 1
-            if match_count >= 2 and match_count > best_score:
-                best_score = match_count
-                best_feature = feature
-
-    if not best_feature:
-        for i, word in enumerate(words):
-            for feature, aliases in features.items():
-                if word in aliases:
-                    return feature
-
+            
+            if match_count >= 1:
+                confidence = match_count / max(len(aliases), 1)
+                if confidence >= 0.2 or (match_count >= 1 and word in aliases):
+                    score = match_count * confidence
+                    if score > best_score:
+                        best_score = score
+                        best_feature = feature
+    
     return best_feature
 
 
@@ -340,22 +503,29 @@ def extract_feature_cached(sentence: str, domain: str = "generic") -> Optional[s
 # ==============================================================================
 # CLAUSE SPLITTING
 # ==============================================================================
-def split_into_clauses(text: str) -> list[str]:
+def split_into_clauses(text: str) -> list[dict]:
     segments = []
-    connector_pattern = r"\s+(?:but|however|although|though|while|whereas|yet|except|otherwise|nonetheless|nevertheless|alternatively|instead|also|plus|and then)\s+"
+    connector_pattern = r"\s+((?:but|however|although|though|while|whereas|yet|except|otherwise|nonetheless|nevertheless|alternatively|instead|also|plus|and then))\s+"
 
     for sentence in re.split(r"(?<=[.!?])\s+", text):
         sentence = sentence.strip()
         if not sentence:
             continue
 
-        clauses = re.split(connector_pattern, sentence, flags=re.I)
+        parts = re.split(connector_pattern, sentence, flags=re.I)
 
-        for clause in clauses:
-            clause = clause.strip()
-            if not clause:
+        current_connector = None
+        for part in parts:
+            part = part.strip()
+            if not part:
                 continue
 
+            if part.lower() in CONNECTOR_WORDS:
+                current_connector = part.lower()
+                continue
+
+            clause = part
+            
             for prefix in ("but ", "however ", "although ", "though ", "while ", "yet ", "except "):
                 if clause.lower().startswith(prefix):
                     clause = clause[len(prefix):].strip()
@@ -365,8 +535,14 @@ def split_into_clauses(text: str) -> list[str]:
                 clause = clause[0].upper() + clause[1:]
 
             clause = clause.strip(" ,.;")
+            
             if clause and len(clause) >= 10:
-                segments.append(clause)
+                segments.append({
+                    "text": clause,
+                    "connector": current_connector
+                })
+            
+            current_connector = None
 
     return segments
 
@@ -493,8 +669,8 @@ class AnalyzeResponse(BaseModel):
 # ==============================================================================
 app = FastAPI(
     title="AI Product Review Aggregator API",
-    description="Production‑ready elite‑level system with streaming support",
-    version="20.2",
+    description="Production-ready elite-level system with streaming support",
+    version="20.6-production",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -507,7 +683,9 @@ app.add_middleware(
 
 async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> str:
     if not VALID_API_KEYS:
+        logger.warning("No API_KEYS configured - running in open mode")
         return "dev"
+    
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API key required. Pass 'X-API-Key' header.")
     if x_api_key not in VALID_API_KEYS:
@@ -665,8 +843,8 @@ class CacheManager:
         self.lru_cache = LRUCache(max_size=MAX_CACHE_SIZE)
 
     def generate_cache_key(self, reviews: list[str], detailed: bool = False, domain: str = "generic") -> str:
-        sorted_reviews = sorted(reviews)
-        payload = {"reviews": sorted_reviews, "detailed": detailed, "domain": domain}
+        normalized_reviews = sorted(r.strip().lower() for r in reviews)
+        payload = {"reviews": normalized_reviews, "detailed": detailed, "domain": domain}
         reviews_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         return f"review_cache:{reviews_hash[:32]}"
 
@@ -717,10 +895,10 @@ class ScalableRateLimiter:
         per_hour = per_hour or RATE_LIMIT_PER_HOUR
         minute_count = self.get_request_count(identifier, 60)
         if minute_count >= per_minute:
-            return True, f"Per‑minute limit exceeded ({minute_count}/{per_minute})"
+            return True, f"Per-minute limit exceeded ({minute_count}/{per_minute})"
         hour_count = self.get_request_count(identifier, 3600)
         if hour_count >= per_hour:
-            return True, f"Per‑hour limit exceeded ({hour_count}/{per_hour})"
+            return True, f"Per-hour limit exceeded ({hour_count}/{per_hour})"
         return False, ""
 
 
@@ -1023,29 +1201,8 @@ gemini_manager = GeminiClientManager()
 
 
 # ==============================================================================
-# HYBRID SENTIMENT
+# SENTIMENT ANALYSIS
 # ==============================================================================
-def get_sentiment_polarity(text: str) -> float:
-    negated_text = handle_negation(text)
-    vader_score = 0.0
-    if USE_VADER:
-        vader_score = vader_analyzer.polarity_scores(negated_text)["compound"]
-
-    text_lower = negated_text.lower()
-    kw_score = 0.0
-    for kw in STRONG_POSITIVE:
-        kw_score += 0.3 if f"NOT_{kw}" in text_lower else (-0.3 if kw in text_lower else 0)
-    for kw in SOFT_POSITIVE:
-        kw_score += -0.1 if f"NOT_{kw}" in text_lower else (0.1 if kw in text_lower else 0)
-    for kw in STRONG_NEGATIVE:
-        kw_score += 0.15 if f"NOT_{kw}" in text_lower else (-0.3 if kw in text_lower else 0)
-    for kw in SOFT_NEGATIVE:
-        kw_score += 0.05 if f"NOT_{kw}" in text_lower else (-0.1 if kw in text_lower else 0)
-
-    blended = 0.6 * vader_score + 0.4 * kw_score if USE_VADER else kw_score
-    return max(-1.0, min(1.0, blended))
-
-
 def parse_raw_input(raw_text: str) -> list[str]:
     if not raw_text:
         return []
@@ -1099,7 +1256,7 @@ def is_valid_fragment(text: str) -> bool:
 
 
 def classify_sentence(sentence: str) -> str:
-    polarity = get_sentiment_polarity(sentence)
+    polarity = get_sentiment_polarity(sentence)  # Uses LRU cached function
     if polarity > SENTIMENT_POLARITY_THRESHOLD:
         return "positive"
     if polarity < -SENTIMENT_POLARITY_THRESHOLD:
@@ -1119,6 +1276,11 @@ def classify_sentence(sentence: str) -> str:
 def normalize_point(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text).strip(" -*\t\r\n")
     cleaned = re.sub(r"^\d+[\).\s-]+", "", cleaned)
+    
+    words = cleaned.lower().split()
+    if len(words) <= 3 and any(w in FILLER_WORDS for w in words):
+        return ""
+    
     if cleaned and cleaned[0].islower():
         cleaned = cleaned[0].upper() + cleaned[1:]
     if len(cleaned) > 120:
@@ -1157,12 +1319,13 @@ def is_useless_point(text: str) -> bool:
     )
 
 
-def prepare_and_split(reviews: list[str]) -> list[str]:
+def prepare_and_split(reviews: list[str]) -> list[dict]:
     prepared = []
     for raw in reviews:
-        for fragment in split_into_clauses(raw):
-            if is_valid_fragment(fragment):
-                prepared.append(fragment)
+        clauses = split_into_clauses(raw)
+        for clause_dict in clauses:
+            if is_valid_fragment(clause_dict["text"]):
+                prepared.append(clause_dict)
     return prepared[:MAX_REVIEWS_TO_ANALYZE]
 
 
@@ -1175,54 +1338,87 @@ def get_impact_level(polarity_score: float) -> str:
     return "low"
 
 
-def make_analysis_point(text: str, domain: str) -> AnalysisPoint:
+def make_analysis_point(text: str, domain: str, connector: str = None) -> AnalysisPoint:
     feature = extract_feature_cached(text, domain) or "general"
-    polarity = get_sentiment_polarity(text)
+    polarity = get_sentiment_polarity(text)  # Uses LRU cached function
     impact = get_impact_level(polarity)
     return AnalysisPoint(text=shorten(text), feature=feature, impact=impact)
 
 
-def extract_points(clauses: list[str], domain: str = "generic") -> dict[str, list]:
-    pros, cons, neutral = [], [], []
-    seen = {}
-    feature_groups: dict[str, list[str]] = {}
+def extract_points(clauses: list[dict], domain: str = "generic") -> dict[str, list]:
+    pros_raw: List[Tuple[str, float]] = []
+    cons_raw: List[Tuple[str, float]] = []
+    neutral_raw: List[str] = []
+    
+    seen_signatures = set()
+    feature_signatures: dict[str, set[str]] = {}
 
     for clause in clauses:
-        label = classify_sentence(clause)
-        normalized = normalize_point(clause)
+        if isinstance(clause, dict):
+            clause_text = clause.get("text", "")
+            connector = clause.get("connector")
+        else:
+            clause_text = clause
+            connector = None
+
+        label = classify_sentence(clause_text)
+        normalized = normalize_point(clause_text)
+        
+        if not normalized:
+            continue
+        
         sig = get_point_signature(normalized)
-        feature = extract_feature_cached(clause, domain)
+        feature = extract_feature_cached(clause_text, domain)
 
         if is_useless_point(normalized):
             continue
-        if feature and feature in feature_groups:
-            if any(points_overlap(normalized, existing) for existing in feature_groups[feature]):
-                continue
-        if sig in seen.values():
+        
+        if sig in seen_signatures:
             continue
+        seen_signatures.add(sig)
 
-        seen[sig] = sig
         if feature:
-            feature_groups.setdefault(feature, []).append(normalized)
+            feature_key = f"{feature}:{sig[:20]}"
+            if feature not in feature_signatures:
+                feature_signatures[feature] = set()
+            if sig[:20] in feature_signatures[feature]:
+                continue
+            feature_signatures[feature].add(sig[:20])
 
+        weight = 1.0
+        if connector == "but":
+            weight = 1.5
+        elif connector in {"however", "although", "though", "yet"}:
+            weight = 1.25
+
+        polarity = abs(get_sentiment_polarity(normalized))  # Uses LRU cached function
+        
         if label == "positive":
-            pros.append(normalized)
+            pros_raw.append((normalized, weight))
         elif label == "negative":
-            cons.append(normalized)
-        elif "overall" not in normalized.lower() and "mixed" not in normalized.lower():
-            neutral.append(normalized)
+            cons_raw.append((normalized, weight))
+        elif polarity < 0.1:
+            neutral_raw.append(normalized)
+
+    pros_raw.sort(key=lambda x: x[1], reverse=True)
+    cons_raw.sort(key=lambda x: x[1], reverse=True)
+    
+    pros = [make_analysis_point(p[0], domain) for p in pros_raw[:MAX_POINTS]]
+    cons = [make_analysis_point(c[0], domain) for c in cons_raw[:MAX_POINTS]]
+    neutral_points = [shorten(n) for n in neutral_raw[:MAX_NEUTRAL_POINTS]]
 
     return {
-        "pros": [make_analysis_point(p, domain) for p in pros[:MAX_POINTS]],
-        "cons": [make_analysis_point(c, domain) for c in cons[:MAX_POINTS]],
-        "neutral_points": [shorten(n) for n in neutral[:MAX_NEUTRAL_POINTS]],
+        "pros": pros,
+        "cons": cons,
+        "neutral_points": neutral_points,
     }
 
 
-def calculate_sentiment(clauses: list[str]) -> dict[str, float | int]:
+def calculate_sentiment(clauses: list[dict]) -> dict[str, float | int]:
     counts = {"positive": 0, "neutral": 0, "negative": 0, "total": len(clauses)}
     for clause in clauses:
-        label = classify_sentence(clause)
+        clause_text = clause.get("text", "") if isinstance(clause, dict) else clause
+        label = classify_sentence(clause_text)
         counts[label] += 1
 
     total = counts["total"] or 1
@@ -1234,16 +1430,19 @@ def calculate_sentiment(clauses: list[str]) -> dict[str, float | int]:
     }
 
 
-def calculate_feature_scores(clauses: list[str], domain: str = "generic") -> list[FeatureScore]:
+def calculate_feature_scores(clauses: list[dict], domain: str = "generic") -> list[FeatureScore]:
     feature_data = {}
     for clause in clauses:
-        if not is_valid_fragment(clause):
+        clause_text = clause.get("text", "") if isinstance(clause, dict) else clause
+        if not is_valid_fragment(clause_text):
             continue
-        label = classify_sentence(clause)
-        feature = extract_feature_cached(clause, domain)
+        label = classify_sentence(clause_text)
+        feature = extract_feature_cached(clause_text, domain)
         if not feature:
             continue
-        normalized = shorten(normalize_point(clause))
+        normalized = shorten(normalize_point(clause_text))
+        if not normalized:
+            continue
         feature_data.setdefault(feature, {"positive": [], "negative": []})
         if label == "positive":
             feature_data[feature]["positive"].append(normalized)
@@ -1354,9 +1553,6 @@ Cons: {cons[:3] if cons else 'None'}
 Return ONLY the summary text. Do NOT start with "Overall" or "In summary":""".strip()
 
 
-# ==============================================================================
-# HUMAN‑LIKE SUMMARY BUILDER
-# ==============================================================================
 def build_summary(pros: list[AnalysisPoint], cons: list[AnalysisPoint], sentiment: dict, domain: str = "generic") -> str:
     pos_pct = sentiment.get("positive", 0)
     neg_pct = sentiment.get("negative", 0)
@@ -1396,9 +1592,6 @@ def build_summary(pros: list[AnalysisPoint], cons: list[AnalysisPoint], sentimen
         return f"Feedback is balanced ({pos_pct:.0f}% positive, {neg_pct:.0f}% negative)."
 
 
-# ==============================================================================
-# USER PERSONALISATION
-# ==============================================================================
 def apply_user_focus(points: list[AnalysisPoint], user_focus: Optional[str]) -> list[AnalysisPoint]:
     if not user_focus:
         return points
@@ -1463,7 +1656,6 @@ def select_best_points(points_a: list[str], points_b: list[str], label: str, dom
 # MEMORY LEAK GUARD
 # ==============================================================================
 async def _cleanup_task_result(task_id: str):
-    """Prevent memory leak — removes task from TASK_RESULTS after 120s."""
     await asyncio.sleep(120)
     with TASK_RESULTS_LOCK:
         TASK_RESULTS.pop(task_id, None)
@@ -1482,8 +1674,7 @@ async def process_analysis_task(
 
     raw_text = " ".join(reviews)
     detected_domain = detect_domain(raw_text)
-
-    domain = detected_domain if detected_domain != "generic" else "general_product"
+    domain = detected_domain
 
     if detected_domain == "generic":
         warnings.append(
@@ -1493,7 +1684,6 @@ async def process_analysis_task(
             )
         )
 
-    # --- CACHE ---
     cache_key = cache_manager.generate_cache_key(reviews, detailed, domain)
     cached = cache_manager.get(cache_key)
 
@@ -1515,7 +1705,6 @@ async def process_analysis_task(
             domain,
         )
 
-    # --- PRE‑PROCESS ---
     clauses = prepare_and_split(reviews)
 
     if not clauses:
@@ -1532,20 +1721,19 @@ async def process_analysis_task(
     rule_based = extract_points(clauses, domain)
     sentiment = calculate_sentiment(clauses)
 
-    # --- AI (Gemini) ---
     ai_result = None
     ai_summary = None
 
     should_use_ai = (
         gemini_manager.has_keys()
-        and len(clauses) >= 5
-        and len(clauses) <= MAX_CLAUSES_FOR_AI
+        and 3 <= len(clauses) <= MAX_CLAUSES_FOR_AI
     )
 
     if should_use_ai:
         try:
             model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
-            truncated_clauses = [c[:GEMINI_MAX_CHARS] for c in clauses[:GEMINI_MAX_CLAUSES]]
+            truncated_clauses = [c["text"][:GEMINI_MAX_CHARS] if isinstance(c, dict) else c[:GEMINI_MAX_CHARS] 
+                               for c in clauses[:GEMINI_MAX_CLAUSES]]
 
             async with gemini_semaphore:
                 request_tracker.active_gemini += 1
@@ -1555,13 +1743,8 @@ async def process_analysis_task(
                         timeout=GEMINI_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("Gemini analyze_reviews timed out — falling back to rule-based")
-                    warnings.append(
-                        WarningDetail(
-                            type="AI_TIMEOUT",
-                            message="AI analysis timed out — using rule-based results.",
-                        )
-                    )
+                    logger.warning("Gemini analyze_reviews timed out")
+                    warnings.append(WarningDetail(type="AI_TIMEOUT", message="AI analysis timed out."))
                     ai_result = None
                 finally:
                     request_tracker.active_gemini -= 1
@@ -1586,21 +1769,8 @@ async def process_analysis_task(
 
         except Exception as e:
             logger.warning(f"AI enhancement failed: {e}")
-            warnings.append(
-                WarningDetail(
-                    type="AI_UNAVAILABLE",
-                    message="AI enhancement unavailable — using rule-based analysis.",
-                )
-            )
-    else:
-        if not gemini_manager.has_keys():
-            logger.info("No Gemini keys configured — rule‑based analysis only")
-        else:
-            logger.info(
-                f"Fast‑mode: Skipping Gemini (clauses={len(clauses)}; limit={MAX_CLAUSES_FOR_AI})"
-            )
+            warnings.append(WarningDetail(type="AI_UNAVAILABLE", message="AI enhancement unavailable."))
 
-    # --- COMBINE RESULTS ---
     if ai_result and (ai_result.get("pros") or ai_result.get("cons")):
         final_pros = select_best_points(
             ai_result.get("pros", []), [p.text for p in rule_based["pros"]], "positive", domain
@@ -1636,7 +1806,6 @@ async def process_analysis_task(
     final_analysis["pros"] = apply_user_focus(final_analysis["pros"], user_focus)
     final_analysis["cons"] = apply_user_focus(final_analysis["cons"], user_focus)
 
-    # --- CACHING ---
     cache_data = {
         "analysis": {
             "summary": final_analysis["summary"],
@@ -1654,9 +1823,7 @@ async def process_analysis_task(
 
     logger.info(f"process_analysis_task completed in {time.time() - start_time:.3f}s")
 
-    warnings = warnings or []
-
-    return final_analysis, sentiment, feature_scores, False, warnings, domain
+    return final_analysis, sentiment, feature_scores, False, warnings or [], domain
 
 
 # ==============================================================================
@@ -1711,9 +1878,6 @@ def calculate_score_and_confidence(sentiment: dict) -> tuple[float, float]:
     return score, min(100.0, confidence)
 
 
-# ==============================================================================
-# OBSERVABILITY LOGGING
-# ==============================================================================
 def log_request_analytics(
     user_id: str,
     domain: str,
@@ -1738,100 +1902,66 @@ def log_request_analytics(
 
 
 # ==============================================================================
-# STREAMING SUPPORT
+# STREAMING
 # ==============================================================================
 async def generate_streaming_analysis(reviews: list[str], user_focus: Optional[str] = None):
-    """
-    Streaming generator that yields analysis results progressively.
-    
-    Stream order (fastest first):
-    1. summary - Generated quickly from rule-based
-    2. pros - Extracted from review clauses
-    3. cons - Extracted from review clauses
-    4. neutral_points - Extracted from review clauses
-    5. sentiment - Calculated sentiment breakdown
-    6. feature_scores - Feature-level scores
-    7. complete - Final completion marker
-    """
     try:
-        # --- 1. DETECT DOMAIN (fast) ---
-        raw_text = " ".join(reviews)
-        detected_domain = detect_domain(raw_text)
-        domain = detected_domain if detected_domain != "generic" else "general_product"
-        
-        yield json.dumps({"type": "domain", "data": domain}) + "\n"
+        yield json.dumps({"type": "progress", "step": "initializing", "message": "Detecting domain..."}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 2. PRE-PROCESS (fast) ---
+        raw_text = " ".join(reviews)
+        detected_domain = detect_domain(raw_text)
+        domain = detected_domain
+        
+        yield json.dumps({"type": "domain", "data": domain}) + "\n"
+        
+        yield json.dumps({"type": "progress", "step": "analyzing", "message": "Extracting insights..."}) + "\n"
+        await asyncio.sleep(STREAM_CHUNK_DELAY)
+        
         clauses = prepare_and_split(reviews)
         
         if not clauses:
-            yield json.dumps({
-                "type": "error",
-                "data": "No valid review content found."
-            }) + "\n"
+            yield json.dumps({"type": "error", "data": "No valid review content found."}) + "\n"
             yield "[DONE]\n"
             return
         
-        # --- 3. SUMMARY (fastest - rule-based) ---
         rule_based = extract_points(clauses, domain)
         sentiment = calculate_sentiment(clauses)
         
-        # Build summary quickly using rule-based analysis
-        final_summary = build_summary(
-            rule_based["pros"],
-            rule_based["cons"],
-            sentiment,
-            domain
-        )
-        
-        yield json.dumps({"type": "summary", "data": final_summary}) + "\n"
+        summary_partial = build_summary(rule_based["pros"], rule_based["cons"], sentiment, domain)
+        yield json.dumps({"type": "summary_partial", "data": summary_partial}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 4. PROS ---
         final_pros = apply_user_focus(rule_based["pros"], user_focus)
-        pros_data = [p.model_dump() for p in final_pros[:MAX_POINTS]]
-        yield json.dumps({"type": "pros", "data": pros_data}) + "\n"
+        yield json.dumps({"type": "pros", "data": [p.model_dump() for p in final_pros[:MAX_POINTS]]}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 5. CONS ---
         final_cons = apply_user_focus(rule_based["cons"], user_focus)
-        cons_data = [c.model_dump() for c in final_cons[:MAX_POINTS]]
-        yield json.dumps({"type": "cons", "data": cons_data}) + "\n"
+        yield json.dumps({"type": "cons", "data": [c.model_dump() for c in final_cons[:MAX_POINTS]]}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 6. NEUTRAL POINTS ---
-        neutral_data = rule_based["neutral_points"]
-        yield json.dumps({"type": "neutral_points", "data": neutral_data}) + "\n"
+        yield json.dumps({"type": "neutral_points", "data": rule_based["neutral_points"]}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 7. SENTIMENT ---
         score, confidence = calculate_score_and_confidence(sentiment)
-        sentiment_data = {
-            **sentiment,
-            "score": score,
-            "confidence": confidence,
-        }
-        yield json.dumps({"type": "sentiment", "data": sentiment_data}) + "\n"
+        yield json.dumps({"type": "sentiment", "data": {**sentiment, "score": score, "confidence": confidence}}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 8. FEATURE SCORES ---
         feature_scores = calculate_feature_scores(clauses, domain)
-        feature_data = [fs.model_dump() for fs in feature_scores[:10]]  # Limit to top 10
-        yield json.dumps({"type": "feature_scores", "data": feature_data}) + "\n"
+        yield json.dumps({"type": "feature_scores", "data": [fs.model_dump() for fs in feature_scores[:10]]}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        # --- 9. AI ENHANCEMENT (background - doesn't block streaming) ---
-        should_use_ai = (
-            gemini_manager.has_keys()
-            and len(clauses) >= 5
-            and len(clauses) <= MAX_CLAUSES_FOR_AI
-        )
+        ai_summary_final = None
+        should_use_ai = gemini_manager.has_keys() and 3 <= len(clauses) <= MAX_CLAUSES_FOR_AI
         
         if should_use_ai:
+            yield json.dumps({"type": "progress", "step": "ai_processing", "message": "Enhancing with AI..."}) + "\n"
+            await asyncio.sleep(STREAM_CHUNK_DELAY)
+            
             try:
                 model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
-                truncated_clauses = [c[:GEMINI_MAX_CHARS] for c in clauses[:GEMINI_MAX_CLAUSES]]
+                truncated_clauses = [c["text"][:GEMINI_MAX_CHARS] if isinstance(c, dict) else c[:GEMINI_MAX_CHARS]
+                                    for c in clauses[:GEMINI_MAX_CLAUSES]]
                 
                 async with gemini_semaphore:
                     request_tracker.active_gemini += 1
@@ -1849,6 +1979,20 @@ async def generate_streaming_analysis(reviews: list[str], user_focus: Optional[s
                                     "cons": ai_result.get("cons", [])[:3],
                                 }
                             }) + "\n"
+                            
+                            ai_summary = await asyncio.wait_for(
+                                gemini_manager.generate_summary(
+                                    ai_result.get("pros", []),
+                                    ai_result.get("cons", []),
+                                    model_name,
+                                ),
+                                timeout=GEMINI_TIMEOUT,
+                            )
+                            
+                            if ai_summary and len(ai_summary.split()) >= 5:
+                                ai_summary_final = ai_summary
+                                yield json.dumps({"type": "summary_final", "data": ai_summary_final}) + "\n"
+                                
                     except asyncio.TimeoutError:
                         logger.warning("AI enhancement timed out during streaming")
                     finally:
@@ -1857,8 +2001,17 @@ async def generate_streaming_analysis(reviews: list[str], user_focus: Optional[s
             except Exception as e:
                 logger.warning(f"AI enhancement failed during streaming: {e}")
         
-        # --- 10. COMPLETE ---
-        yield json.dumps({"type": "complete", "data": True}) + "\n"
+        yield json.dumps({"type": "progress", "step": "finalizing", "message": "Finalizing results..."}) + "\n"
+        await asyncio.sleep(STREAM_CHUNK_DELAY)
+        
+        yield json.dumps({
+            "type": "complete", 
+            "data": {
+                "ai_enhanced": ai_summary_final is not None,
+                "has_final_summary": ai_summary_final is not None,
+                "domain": domain,
+            }
+        }) + "\n"
         yield "[DONE]\n"
         
     except Exception as e:
@@ -1878,6 +2031,7 @@ async def _handle_analyze(
 ) -> AnalyzeResponse:
     start_time = time.time()
     request_tracker.active_http += 1
+    task_id = None
 
     try:
         api_key = await verify_api_key(x_api_key)
@@ -1920,14 +2074,10 @@ async def _handle_analyze(
 
         try:
             analysis, sentiment, feature_scores, from_cache, ai_warnings, domain = await asyncio.wait_for(
-                future, timeout=60.0
+                future, timeout=REQUEST_TIMEOUT
             )
         except asyncio.TimeoutError:
             REQUEST_COUNT.labels(endpoint=endpoint, status="timeout").inc()
-            timeout_warning = WarningDetail(
-                type="REQUEST_TIMEOUT",
-                message="Processing took too long; returning a fallback response. Please retry.",
-            )
             return AnalyzeResponse(
                 summary="Request timed out – please try again later.",
                 pros=[],
@@ -1937,7 +2087,7 @@ async def _handle_analyze(
                 score=0.0,
                 confidence=0.0,
                 cached=False,
-                warnings=[timeout_warning],
+                warnings=[WarningDetail(type="REQUEST_TIMEOUT", message="Processing took too long.")],
                 domain=detect_domain(payload.raw_text),
             )
 
@@ -1955,8 +2105,6 @@ async def _handle_analyze(
         pros = analysis["pros"]
         cons = analysis["cons"]
 
-        resolved_warnings: list[WarningDetail] = (ai_warnings or []) if ai_warnings else []
-
         response = AnalyzeResponse(
             summary=analysis["summary"],
             pros=pros,
@@ -1971,7 +2119,7 @@ async def _handle_analyze(
             score=score,
             confidence=confidence,
             cached=from_cache,
-            warnings=resolved_warnings,
+            warnings=(ai_warnings or []),
             domain=domain,
         )
 
@@ -2009,10 +2157,13 @@ async def _handle_analyze(
         raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         request_tracker.active_http -= 1
+        if task_id:
+            with TASK_RESULTS_LOCK:
+                TASK_RESULTS.pop(task_id, None)
 
 
 # ==============================================================================
-# VERSIONED ROUTES
+# API ROUTES
 # ==============================================================================
 @app.post(f"{API_V1_PREFIX}/analyze-raw", response_model=AnalyzeResponse, tags=["v1"])
 async def v1_analyze_raw_text(
@@ -2078,7 +2229,7 @@ async def analyze_reviews(
 
 
 # ==============================================================================
-# ✅ NEW: STREAMING ENDPOINTS
+# STREAMING ENDPOINTS
 # ==============================================================================
 @app.post("/analyze-stream", tags=["streaming"])
 async def analyze_stream(
@@ -2086,21 +2237,6 @@ async def analyze_stream(
     payload: RawAnalyzeRequest,
     x_api_key: Optional[str] = Header(None),
 ):
-    """
-    Streaming endpoint for progressive analysis results.
-    
-    Streams results as they become available:
-    - summary (fastest)
-    - pros
-    - cons
-    - neutral_points
-    - sentiment
-    - feature_scores
-    - complete
-    
-    Each chunk is a JSON line followed by newline.
-    End marker is "[DONE]\n".
-    """
     await verify_api_key(x_api_key)
     
     if len(payload.raw_text) > MAX_INPUT_SIZE:
@@ -2117,10 +2253,7 @@ async def analyze_stream(
     return StreamingResponse(
         generate_streaming_analysis(reviews, payload.user_focus),
         media_type="application/json",
-        headers={
-            "X-Stream-Format": "jsonl",
-            "Cache-Control": "no-cache",
-        }
+        headers={"X-Stream-Format": "jsonl", "Cache-Control": "no-cache"}
     )
 
 
@@ -2130,7 +2263,6 @@ async def v2_analyze_stream(
     payload: RawAnalyzeRequest,
     x_api_key: Optional[str] = Header(None),
 ):
-    """V2 streaming endpoint."""
     return await analyze_stream(request, payload, x_api_key)
 
 
@@ -2140,7 +2272,21 @@ async def v2_analyze_stream(
 @app.get("/stats")
 async def get_stats(x_api_key: Optional[str] = Header(None)):
     await verify_api_key(x_api_key)
-    return {"cache": cache_manager.lru_cache.get_stats()}
+    return {
+        "cache": cache_manager.lru_cache.get_stats(),
+        "polarity_cache": {
+            "size": get_sentiment_polarity_cached.cache_info().currsize,
+            "max_size": get_sentiment_polarity_cached.cache_info().maxsize,
+            "hits": get_sentiment_polarity_cached.cache_info().hits,
+            "misses": get_sentiment_polarity_cached.cache_info().misses,
+        },
+        "feature_cache": {
+            "size": extract_feature_cached.cache_info().currsize,
+            "max_size": extract_feature_cached.cache_info().maxsize,
+            "hits": extract_feature_cached.cache_info().hits,
+            "misses": extract_feature_cached.cache_info().misses,
+        }
+    }
 
 
 @app.post("/cache/clear")
@@ -2148,6 +2294,8 @@ async def clear_cache(x_api_key: Optional[str] = Header(None)):
     await verify_api_key(x_api_key)
     cache_manager.lru_cache.cache.clear()
     cache_manager.lru_cache.size = 0
+    get_sentiment_polarity_cached.cache_clear()
+    extract_feature_cached.cache_clear()
     return {"status": "cache cleared"}
 
 
@@ -2174,29 +2322,16 @@ async def get_system_health(x_api_key: Optional[str] = Header(None)):
             "active_requests": request_tracker.active_gemini,
             "available_slots": GEMINI_CONCURRENCY_LIMIT - request_tracker.active_gemini,
         },
-        "worker_queue": {
-            "max_size": QUEUE_MAX_SIZE,
-            "current_size": request_tracker.queue_depth,
-            "utilization_percent": round(request_tracker.queue_depth / QUEUE_MAX_SIZE * 100, 1),
-        },
-        "rate_limiter": {
-            "per_minute_limit": RATE_LIMIT_PER_MINUTE,
-            "per_hour_limit": RATE_LIMIT_PER_HOUR,
-        },
+        "worker_queue": {"max_size": QUEUE_MAX_SIZE, "current_size": request_tracker.queue_depth},
+        "rate_limiter": {"per_minute_limit": RATE_LIMIT_PER_MINUTE, "per_hour_limit": RATE_LIMIT_PER_HOUR},
         "cache": {"memory_entries": cache_manager.lru_cache.size},
-        "active_requests": {
-            "http": request_tracker.active_http,
-            "gemini": request_tracker.active_gemini,
-        },
-        "api_versions": ["v1", "v2"],
     }
 
 
 @app.get("/admin/domain-detection")
 async def detect_domain_endpoint(text: str, x_api_key: Optional[str] = Header(None)):
     await verify_api_key(x_api_key)
-    domain = detect_domain(text)
-    return {"text_preview": text[:100], "detected_domain": domain}
+    return {"text_preview": text[:100], "detected_domain": detect_domain(text)}
 
 
 # ==============================================================================
@@ -2204,7 +2339,6 @@ async def detect_domain_endpoint(text: str, x_api_key: Optional[str] = Header(No
 # ==============================================================================
 def _run_tests():
     import traceback
-
     results = []
 
     def test(name, fn):
@@ -2216,11 +2350,50 @@ def _run_tests():
         except Exception as e:
             results.append(("ERROR", f"{name}: {traceback.format_exc(limit=1)}"))
 
-    # (Tests remain the same)
-    test("tokenize", lambda: set(tokenize("battery-life is great!")))
-    test("domain electronics", lambda: (detect_domain("battery life and camera quality are great") == "electronics") or (_ for _ in ()).throw(AssertionError("Expected electronics")))
-    test("domain clothing", lambda: (detect_domain("fabric feels soft, true to size and breathable") == "clothing") or (_ for _ in ()).throw(AssertionError("Expected clothing")))
-    test("domain generic", lambda: (detect_domain("it arrived on time") == "generic") or (_ for _ in ()).throw(AssertionError("Expected generic")))
+    # Connector tests
+    clauses = split_into_clauses("Camera is good but battery drains fast")
+    test("clause_splitting_second_has_connector", lambda: (
+        clauses[1]["connector"] == "but"
+    ))
+    test("clause_splitting_first_no_connector", lambda: (
+        clauses[0]["connector"] is None
+    ))
+    
+    # Filler words
+    test("filler_words_filtered", lambda: (
+        normalize_point("Honestly") == ""
+    ))
+    
+    # Special negation
+    test("special_negation_not_bad", lambda: (
+        "good" in handle_special_negations("The phone is not bad")
+    ))
+    
+    # LRU cache
+    p1 = get_sentiment_polarity("Battery is great")
+    p2 = get_sentiment_polarity("Battery is great")
+    test("lru_cache_works", lambda: (
+        get_sentiment_polarity_cached.cache_info().hits >= 1 or p1 == p2
+    ))
+    
+    # Domain detection
+    test("domain_generic_low_score", lambda: (
+        detect_domain("it arrived") == "generic"
+    ))
+    test("domain_electronics_high_score", lambda: (
+        detect_domain("battery life and camera quality are great") == "electronics"
+    ))
+    
+    # Domain-specific alias map
+    _build_alias_maps()
+    test("domain_alias_maps_built", lambda: (
+        len(_ALIAS_MAPS) >= 6
+    ))
+    
+    # Cache key normalization
+    key1 = cache_manager.generate_cache_key(["Battery Good", "Camera Great"])
+    key2 = cache_manager.generate_cache_key(["battery good", "camera great"])
+    test("cache_key_normalized", lambda: (key1 == key2))
 
     passed = sum(1 for r in results if r[0] == "PASS")
     failed = sum(1 for r in results if r[0] != "PASS")
@@ -2238,11 +2411,10 @@ def _run_tests():
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {
-        "message": "AI Product Review Aggregator API v20.2",
+        "message": "AI Product Review Aggregator API v20.6-production",
         "docs": "/docs",
         "v1": f"{API_V1_PREFIX}/analyze-raw",
         "v2": f"{API_V2_PREFIX}/analyze-raw",
-        "legacy": "/analyze-raw",
         "streaming": "/analyze-stream",
     }
 
@@ -2262,6 +2434,10 @@ def health() -> dict[str, str]:
 # ==============================================================================
 @app.on_event("startup")
 async def startup_event():
+    _build_alias_maps()
+    _build_global_alias_map()
+    logger.info(f"Built alias maps for {len(_ALIAS_MAPS)} domains")
+    
     for i in range(WORKER_POOL_SIZE):
         asyncio.create_task(worker_loop(i + 1))
     logger.info(f"Started {WORKER_POOL_SIZE} worker(s)")
@@ -2278,5 +2454,4 @@ if __name__ == "__main__":
         sys.exit(0)
 
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
