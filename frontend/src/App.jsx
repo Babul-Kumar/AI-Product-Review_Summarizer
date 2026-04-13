@@ -5,15 +5,13 @@ import SentimentChart from "./components/SentimentChart";
 // CONFIGURATION
 // ==============================================================================
 
-// 🔥 LOG LEVEL CONTROL - Toggle for production
 const LOG_LEVEL = {
-  DEBUG: true,    // Set to false in production
+  DEBUG: import.meta.env.DEV,
   INFO: true,
   WARN: true,
   ERROR: true,
 };
 
-// Logging utility with levels
 const log = {
   debug: (...args) => LOG_LEVEL.DEBUG && console.debug("[DEBUG]", ...args),
   info: (...args) => LOG_LEVEL.INFO && console.info("[INFO]", ...args),
@@ -23,10 +21,8 @@ const log = {
 
 // Environment Variables
 const API_BASE_URL = import.meta.env.VITE_API_URL || "https://ai-product-review.onrender.com";
-const ANALYZE_URL = `${API_BASE_URL}/analyze`;
+const ANALYZE_URL = `${API_BASE_URL}/analyze-raw`;
 const PING_URL = `${API_BASE_URL}/ping`;
-
-// ✅ API Key from environment (required for protected endpoints)
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 
 // Constants
@@ -37,8 +33,10 @@ const MAX_RETRIES = 2;
 const RETRY_DELAY_BASE = 1500;
 const REQUEST_TIMEOUT_MS = 10000;
 const HEALTH_CHECK_INTERVAL = 30000;
+const MAX_REVIEWS_LIMIT = 30;
+const CACHE_TTL = 60000;
 
-// Non-meaningful patterns to filter out
+// Non-meaningful patterns
 const NON_MEANINGFUL_PATTERNS = [
   /^no summary was returned\.?$/i,
   /^no major recurring strengths were mentioned\.?$/i,
@@ -49,21 +47,30 @@ const NON_MEANINGFUL_PATTERNS = [
   /^input does not appear to be product reviews\.?$/i,
 ];
 
-// Empty result template
 const EMPTY_RESULT = {
   summary: "",
   pros: [],
   cons: [],
   neutral_points: [],
-  sentiment: {
-    positive: 0,
-    neutral: 0,
-    negative: 0,
-    total: 0,
-  },
+  sentiment: { positive: 0, neutral: 0, negative: 0, total: 0 },
   score: 0,
   confidence: 0,
+  feature_scores: [],
 };
+
+// ==============================================================================
+// GLOBAL ERROR HANDLER
+// ==============================================================================
+
+if (typeof window !== "undefined") {
+  window.addEventListener("error", (e) => {
+    log.error("💥 Global error:", e.error?.message || e.message);
+  });
+
+  window.addEventListener("unhandledrejection", (e) => {
+    log.error("💥 Unhandled promise rejection:", e.reason?.message || e.reason);
+  });
+}
 
 // ==============================================================================
 // UTILITY FUNCTIONS
@@ -75,9 +82,7 @@ function toSafeNumber(value) {
 }
 
 function toSafeList(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
+  if (!Array.isArray(value)) return [];
   return value.map((item) => String(item).trim()).filter(Boolean);
 }
 
@@ -101,7 +106,6 @@ function normalizeResult(data) {
     },
     score: toSafeNumber(data?.score),
     confidence: toSafeNumber(data?.confidence),
-    // ✅ Include explained data if available
     explained_pros: Array.isArray(data?.explained_pros) ? data.explained_pros : [],
     explained_cons: Array.isArray(data?.explained_cons) ? data.explained_cons : [],
     feature_scores: Array.isArray(data?.feature_scores) ? data.feature_scores : [],
@@ -126,11 +130,43 @@ function hasMeaningfulInsights(data) {
   return data.pros.some(isMeaningfulItem) || data.cons.some(isMeaningfulItem);
 }
 
+function isMeaningfulReview(text) {
+  return text.length > 10 && /[a-zA-Z]/.test(text);
+}
+
+// ✅ NEW: Safe feature score extraction
+function extractFeatureScore(featureScore) {
+  // Handle { feature: "battery", score: 4.5 }
+  if (featureScore && typeof featureScore === "object" && !Array.isArray(featureScore)) {
+    return {
+      feature: String(featureScore.feature || "").trim(),
+      score: toSafeNumber(featureScore.score),
+    };
+  }
+  
+  // Handle ["battery", 4.5]
+  if (Array.isArray(featureScore) && featureScore.length >= 2) {
+    return {
+      feature: String(featureScore[0] || "").trim(),
+      score: toSafeNumber(featureScore[1]),
+    };
+  }
+  
+  // Handle "battery" (just feature name without score)
+  if (typeof featureScore === "string") {
+    return {
+      feature: featureScore.trim(),
+      score: 0,
+    };
+  }
+  
+  return { feature: "", score: 0 };
+}
+
 // ==============================================================================
 // FETCH UTILITIES
 // ==============================================================================
 
-// Fetch with timeout using AbortController
 function fetchWithTimeout(url, options, timeout = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -141,7 +177,6 @@ function fetchWithTimeout(url, options, timeout = REQUEST_TIMEOUT_MS) {
   }).finally(() => clearTimeout(timeoutId));
 }
 
-// Combined retry + timeout with exponential backoff
 async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 0, requestId = "unknown") {
   try {
     const response = await fetchWithTimeout(url, options);
@@ -151,7 +186,6 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 
       return { success: true, response, retriesUsed: retryCount };
     }
 
-    // Retry on server errors and rate limits
     const shouldRetry = response.status >= 500 || 
                         response.status === 429 || 
                         response.status === 503 || 
@@ -159,7 +193,7 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 
 
     if (shouldRetry && retryCount < retries) {
       const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
-      log.debug(`🔄 [${requestId}] Retry ${retryCount + 1}/${retries} after ${delay}ms (status: ${response.status})`);
+      log.debug(`🔄 [${requestId}] Retry ${retryCount + 1}/${retries} after ${delay}ms`);
       await new Promise((resolve) => setTimeout(resolve, delay));
       return fetchWithRetry(url, options, retries, retryCount + 1, requestId);
     }
@@ -169,16 +203,14 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 
     const isAbort = error.name === "AbortError" || error.message?.includes("aborted");
     const isTimeout = isAbort || error.message?.includes("timeout");
 
-    log.debug(`❌ [${requestId}] Attempt ${retryCount + 1} failed: ${error.message}${isTimeout ? " (TIMEOUT)" : ""}`);
+    log.debug(`❌ [${requestId}] Attempt ${retryCount + 1} failed: ${error.message}`);
 
     if (retryCount < retries && !isAbort) {
       const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
-      log.debug(`🔄 [${requestId}] Retrying after ${delay}ms...`);
       await new Promise((resolve) => setTimeout(resolve, delay));
       return fetchWithRetry(url, options, retries, retryCount + 1, requestId);
     }
 
-    // Create timeout error with flag
     const finalError = new Error(isTimeout 
       ? `Request timed out after ${(retryCount + 1) * REQUEST_TIMEOUT_MS}ms` 
       : error.message);
@@ -193,7 +225,6 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 
 // ==============================================================================
 
 function App() {
-  // State
   const [inputText, setInputText] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -203,54 +234,62 @@ function App() {
   const [lastClickTime, setLastClickTime] = useState(0);
   const [copySuccess, setCopySuccess] = useState(false);
   const [retryInfo, setRetryInfo] = useState(null);
-  const [requestId, setRequestId] = useState(null);
 
-  // Refs
+  const requestIdRef = useRef(null);
   const abortControllerRef = useRef(null);
   const inFlightRef = useRef(false);
   const lastRequestKeyRef = useRef("");
   const lastResultRef = useRef(null);
+  const lastCacheTimeRef = useRef(0);
   const isMountedRef = useRef(true);
 
   // ==============================================================================
   // EFFECTS
   // ==============================================================================
 
-  // Cleanup on unmount
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
-        log.debug("[Cleanup] Aborted pending request on unmount");
       }
     };
   }, []);
 
-  // Backend health check
   useEffect(() => {
-    let intervalId;
+    let lastChecked = 0;
 
     const checkServerHealth = async () => {
+      if (document.visibilityState !== "visible") return;
+
+      const now = Date.now();
+      if (now - lastChecked < HEALTH_CHECK_INTERVAL) return;
+      lastChecked = now;
+
       try {
         const response = await fetch(PING_URL, { method: "GET" });
         if (isMountedRef.current) {
           setServerStatus(response.ok ? "online" : "offline");
-          log.debug(`[Health] Server ${response.ok ? "online" : "offline"}`);
         }
       } catch (err) {
         if (isMountedRef.current) {
           setServerStatus("offline");
-          log.warn("[Health] Server unreachable");
         }
       }
     };
 
     checkServerHealth();
-    intervalId = setInterval(checkServerHealth, HEALTH_CHECK_INTERVAL);
+    const intervalId = setInterval(checkServerHealth, HEALTH_CHECK_INTERVAL);
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") checkServerHealth();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
 
-    return () => clearInterval(intervalId);
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, []);
 
   // ==============================================================================
@@ -258,12 +297,10 @@ function App() {
   // ==============================================================================
 
   const getCleanedReviews = useCallback((text) => {
-    const rawReviews = text
-      .split(/\n|\.\s+/)
+    return text
+      .split(/\n+/)
       .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-    return [...new Set(rawReviews)];
+      .filter((line) => isMeaningfulReview(line));
   }, []);
 
   const reviews = getCleanedReviews(inputText);
@@ -272,6 +309,7 @@ function App() {
   const isInputTooShort = trimmedInput.length > 0 && trimmedInput.length < MIN_REVIEW_INPUT_LENGTH;
   const hasMeaningfulResult = result ? hasMeaningfulInsights(result) : false;
   const isInCooldown = Date.now() - lastClickTime < COOLDOWN_MS;
+  const isTruncated = reviews.length > MAX_REVIEWS_LIMIT;
 
   const isAnalyzeDisabled = 
     loading || 
@@ -285,6 +323,32 @@ function App() {
   // ==============================================================================
 
   const copyToClipboard = () => {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      log.warn("[Copy] Clipboard API not available");
+      const textArea = document.createElement("textarea");
+      textArea.value = JSON.stringify({
+        summary: safeResult.summary,
+        pros: safeResult.pros,
+        cons: safeResult.cons,
+        neutral_points: safeResult.neutral_points,
+        sentiment: safeResult.sentiment,
+        score: safeResult.score,
+        confidence: safeResult.confidence,
+        feature_scores: safeResult.feature_scores,
+      }, null, 2);
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand("copy");
+        setCopySuccess(true);
+        setTimeout(() => setCopySuccess(false), 2000);
+      } catch (err) {
+        log.error("[Copy] Fallback failed:", err);
+      }
+      document.body.removeChild(textArea);
+      return;
+    }
+
     const textToCopy = JSON.stringify({
       summary: safeResult.summary,
       pros: safeResult.pros,
@@ -300,34 +364,26 @@ function App() {
       setCopySuccess(true);
       setTimeout(() => setCopySuccess(false), 2000);
     }).catch((err) => {
-      log.error("[Copy] Failed to copy to clipboard:", err);
+      log.error("[Copy] Failed:", err);
     });
   };
 
   const analyzeReviews = async () => {
-    // Prevent duplicate requests
-    if (inFlightRef.current) {
-      log.warn("[Request] Blocked - request already in flight");
-      return;
-    }
+    if (inFlightRef.current) return;
 
-    // Abort any pending request
     if (abortControllerRef.current) {
-      log.debug(`🔴 [${requestId}] Aborting previous request`);
       abortControllerRef.current.abort();
     }
 
-    // Generate unique request ID
     const newRequestId = `REQ-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    setRequestId(newRequestId);
+    requestIdRef.current = newRequestId;
 
     const cleanedReviews = getCleanedReviews(inputText);
+    const limitedReviews = cleanedReviews.slice(0, MAX_REVIEWS_LIMIT);
 
-    // Validations
     if (cleanedReviews.length === 0) {
-      setError("Please enter at least one review before analyzing.");
+      setError("Please enter at least one valid review (minimum 10 characters with letters).");
       setLowQualityMessage("");
-      setResult(null);
       setRetryInfo(null);
       return;
     }
@@ -335,94 +391,70 @@ function App() {
     if (trimmedInput.length < MIN_REVIEW_INPUT_LENGTH) {
       setError("");
       setLowQualityMessage(LOW_QUALITY_MESSAGE);
-      setResult(null);
       setRetryInfo(null);
       return;
     }
 
-    // Client-side rate limiting
     const now = Date.now();
     if (now - lastClickTime < COOLDOWN_MS) {
       setError("Too many requests. Please wait a few seconds.");
       setLowQualityMessage("");
-      setResult(null);
       setRetryInfo(null);
       return;
     }
     setLastClickTime(now);
 
-    // Check for cached result
-    const requestKey = cleanedReviews.join("|");
-    if (requestKey === lastRequestKeyRef.current && lastResultRef.current) {
-      log.debug(`📦 [${newRequestId}] Returning cached result`);
+    const requestKey = JSON.stringify(limitedReviews);
+
+    if (
+      requestKey === lastRequestKeyRef.current &&
+      lastResultRef.current &&
+      Date.now() - lastCacheTimeRef.current < CACHE_TTL
+    ) {
       setError("");
       if (hasMeaningfulInsights(lastResultRef.current)) {
         setLowQualityMessage("");
         setResult(lastResultRef.current);
       } else {
-        setResult(null);
         setLowQualityMessage(LOW_QUALITY_MESSAGE);
       }
       setRetryInfo(null);
       return;
     }
 
-    // Create new abort controller
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Update state
     setLoading(true);
     setError("");
     setLowQualityMessage("");
-    setResult(null);
-    setRetryInfo({ retries: 0, maxRetries: MAX_RETRIES, status: "connecting", requestId: newRequestId });
+    setRetryInfo({ retries: 0, maxRetries: MAX_RETRIES, status: "connecting" });
     inFlightRef.current = true;
 
-    log.info(`🚀 [${newRequestId}] Starting with ${cleanedReviews.length} reviews`);
-
-    // Build headers
-    const headers = {
-      "Content-Type": "application/json",
-    };
-    
-    // ✅ Add API key header if configured
-    if (API_KEY) {
-      headers["X-API-Key"] = API_KEY;
-    }
+    const headers = { "Content-Type": "application/json" };
+    if (API_KEY) headers["X-API-Key"] = API_KEY;
 
     const fetchOptions = {
       method: "POST",
       headers,
-      body: JSON.stringify({ reviews: cleanedReviews }),
+      body: JSON.stringify({ raw_text: limitedReviews.join("\n") }),
       signal: controller.signal,
     };
 
     try {
-      log.debug(`📡 [${newRequestId}] Sending to ${ANALYZE_URL}`);
-      
-      const { success, response, retriesUsed } = await fetchWithRetry(
-        ANALYZE_URL,
-        fetchOptions,
-        MAX_RETRIES,
-        0,
-        newRequestId
+      const { response, retriesUsed } = await fetchWithRetry(
+        ANALYZE_URL, fetchOptions, MAX_RETRIES, 0, newRequestId
       );
 
-      // Update retry info
-      setRetryInfo((prev) => prev ? {
-        ...prev,
-        retries: retriesUsed,
-        status: retriesUsed > 0 ? "retried" : "success",
-      } : null);
+      setRetryInfo((prev) => prev ? { ...prev, retries: retriesUsed, status: retriesUsed > 0 ? "retried" : "success" } : null);
 
-      // Check for abort
       if (controller.signal.aborted) {
-        log.debug(`⚠️ [${newRequestId}] Request aborted`);
+        setError("Request was cancelled. Please try again.");
+        setLoading(false);
+        inFlightRef.current = false;
         return;
       }
 
-      // Parse response
       const responseText = await response.text();
       let data = null;
 
@@ -430,82 +462,74 @@ function App() {
         try {
           data = JSON.parse(responseText);
         } catch {
-          log.error(`❌ [${newRequestId}] Invalid JSON`);
           throw new Error("The server returned invalid JSON.");
         }
       }
 
-      // Handle HTTP errors
       if (!response.ok) {
-        const message = typeof data?.detail === "string" 
-          ? data.detail 
-          : `Server error (${response.status})`;
-        log.error(`❌ [${newRequestId}] ${message}`);
-        throw new Error(message);
+        const message = data?.detail || data?.message || `Server error (${response.status})`;
+        let userMessage = message;
+
+        if (response.status === 422) {
+          userMessage = "⚠️ Invalid input format. Please enter proper reviews.";
+        } else if (message.toLowerCase().includes("no api keys")) {
+          userMessage = "🔑 Backend API keys not configured.";
+        } else if (message.toLowerCase().includes("gemini")) {
+          userMessage = "🤖 AI processing failed. Please try again.";
+        } else if (message.toLowerCase().includes("queue") && message.toLowerCase().includes("full")) {
+          userMessage = "⚠️ Server is busy. Please try again.";
+        } else if (response.status >= 500) {
+          userMessage = "🛠️ Server error. Please try again.";
+        }
+
+        throw new Error(userMessage);
       }
 
-      // Validate response
       if (!data || typeof data !== "object") {
-        log.error(`❌ [${newRequestId}] Empty response`);
         throw new Error("The server returned an empty response.");
       }
 
-      // Normalize and cache result
       const normalizedData = normalizeResult(data);
       lastRequestKeyRef.current = requestKey;
       lastResultRef.current = normalizedData;
-
-      log.info(`✅ [${newRequestId}] Done - ${normalizedData.pros.length} pros, ${normalizedData.cons.length} cons`);
+      lastCacheTimeRef.current = Date.now();
 
       if (hasMeaningfulInsights(normalizedData)) {
         setLowQualityMessage("");
         setResult(normalizedData);
       } else {
-        setResult(null);
         setLowQualityMessage(LOW_QUALITY_MESSAGE);
       }
       setRetryInfo(null);
 
     } catch (requestError) {
-      // Handle abort gracefully
       if (controller.signal.aborted || requestError.isAbort) {
-        log.debug(`⚠️ [${newRequestId}] Request aborted by user`);
+        setError("Request was cancelled. Please try again.");
+        setLoading(false);
+        inFlightRef.current = false;
         return;
       }
 
-      log.error(`❌ [${newRequestId}] Failed: ${requestError.message}`);
-
-      setLowQualityMessage("");
-
-      // Smart error messages
       let errorMessage;
       const errorText = requestError.message || String(requestError);
 
       if (requestError.isTimeout || errorText.includes("timed out")) {
-        errorMessage = "⏱️ Request timed out. The server is taking too long. Please try again.";
+        errorMessage = "⏱️ Request timed out. Please try again.";
       } else if (
         errorText.includes("Failed to fetch") ||
         errorText.includes("NetworkError") ||
-        errorText.includes("Network request failed") ||
         errorText.includes("fetch failed")
       ) {
-        errorMessage = "🔌 Network error. The server might be waking up. Please try again in 10-15 seconds.";
+        errorMessage = "🔌 Network error. Please try again.";
       } else if (errorText.includes("429")) {
-        errorMessage = "⚠️ Too many requests. API rate limit reached. Please wait a moment.";
-      } else if (errorText.includes("401") || errorText.includes("Invalid API key")) {
-        errorMessage = "🔑 Invalid or missing API key. Please check your configuration.";
-      } else if (errorText.includes("500") || errorText.includes("502") || errorText.includes("503") || errorText.includes("504")) {
-        errorMessage = "🛠️ Server error. Please try again in a few moments.";
+        errorMessage = "⚠️ API rate limit reached.";
       } else {
-        errorMessage = errorText || "Something went wrong while connecting to the API.";
+        errorMessage = errorText || "Something went wrong.";
       }
 
       setError(errorMessage);
       setRetryInfo(null);
     } finally {
-      log.info(`🏁 [${newRequestId}] Complete`);
-      
-      // Only update state if component is still mounted
       if (isMountedRef.current) {
         setLoading(false);
         inFlightRef.current = false;
@@ -514,9 +538,9 @@ function App() {
     }
   };
 
-  const handleSubmit = async (event) => {
+  const handleSubmit = (event) => {
     event.preventDefault();
-    await analyzeReviews();
+    analyzeReviews();
   };
 
   // ==============================================================================
@@ -528,10 +552,7 @@ function App() {
     return (
       <ul className="mt-4 space-y-3 text-sm leading-6 text-slate-100">
         {values.map((item, index) => (
-          <li 
-            key={`item-${index}-${typeof item === 'string' ? item.substring(0, 20) : index}`}
-            className="rounded-2xl bg-black/10 px-4 py-3"
-          >
+          <li key={`item-${index}`} className="rounded-2xl bg-black/10 px-4 py-3">
             {item}
           </li>
         ))}
@@ -539,19 +560,54 @@ function App() {
     );
   };
 
+  // ✅ FIXED: Feature score with safe number handling
+  const renderFeatureScore = (feature, score, maxScore = 5) => {
+    const safeScore = toSafeNumber(score); // ✅ SAFE: Handles null, undefined, NaN
+    const percentage = Math.min((safeScore / maxScore) * 100, 100);
+    
+    const getScoreColor = (s) => {
+      if (s >= 4) return "bg-emerald-400";
+      if (s >= 3) return "bg-amber-400";
+      return "bg-rose-400";
+    };
+
+    return (
+      <div key={feature} className="mt-3">
+        <div className="flex justify-between text-sm mb-1">
+          <span className="text-slate-200 capitalize">
+            {feature.replace(/_/g, " ") || "Unknown feature"}
+          </span>
+          <span className="text-slate-300 font-medium">
+            {safeScore.toFixed(1)}/{maxScore}
+          </span>
+        </div>
+        <div className="h-2 rounded-full bg-black/30 overflow-hidden">
+          <div 
+            className={`h-full rounded-full transition-all duration-500 ${getScoreColor(safeScore)}`}
+            style={{ width: `${percentage}%` }}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const renderEmptyChart = () => (
+    <div className="flex h-64 flex-col items-center justify-center rounded-2xl border border-white/10 bg-slate-950/20">
+      <div className="text-4xl mb-3">📊</div>
+      <p className="text-sm text-slate-400">No sentiment data available</p>
+      <p className="text-xs text-slate-500 mt-1">Submit reviews to see the chart</p>
+    </div>
+  );
+
   const renderSkeleton = () => (
-    <section className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-6 shadow-[0_20px_90px_rgba(4,12,10,0.32)] backdrop-blur-xl sm:p-8">
-      <div className="mb-8 animate-pulse">
+    <section className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-6 sm:p-8 animate-pulse">
+      <div className="mb-8">
         <div className="h-8 w-48 rounded-lg bg-white/5" />
         <div className="mt-2 h-4 w-64 rounded bg-white/5" />
       </div>
-
       <div className="mb-6 grid gap-4 sm:grid-cols-3 lg:grid-cols-6">
-        {[...Array(6)].map((_, i) => (
-          <div key={i} className="h-20 rounded-2xl bg-white/5" />
-        ))}
+        {[...Array(6)].map((_, i) => <div key={i} className="h-20 rounded-2xl bg-white/5" />)}
       </div>
-
       <div className="grid gap-6 lg:grid-cols-[1fr_0.95fr]">
         <div className="space-y-6">
           <div className="h-32 rounded-[1.5rem] bg-white/5" />
@@ -559,7 +615,6 @@ function App() {
             <div className="h-40 rounded-[1.5rem] bg-white/5" />
             <div className="h-40 rounded-[1.5rem] bg-white/5" />
           </div>
-          <div className="h-32 rounded-[1.5rem] bg-white/5" />
         </div>
         <div className="h-64 rounded-2xl bg-white/5" />
       </div>
@@ -572,7 +627,6 @@ function App() {
 
   return (
     <main className="relative min-h-screen overflow-hidden px-4 py-10 text-slate-100 sm:px-6 lg:px-8">
-      {/* Background effects */}
       <div aria-hidden="true" className="pointer-events-none absolute inset-0">
         <div className="absolute left-[12%] top-[-4rem] h-72 w-72 rounded-full bg-emerald-300/10 blur-3xl" />
         <div className="absolute right-[-5rem] top-28 h-80 w-80 rounded-full bg-amber-200/8 blur-3xl" />
@@ -580,17 +634,14 @@ function App() {
       </div>
 
       <div className="relative mx-auto flex max-w-6xl flex-col gap-8">
-        {/* Header Section */}
-        <section className="overflow-hidden rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.78)] shadow-[0_25px_120px_rgba(4,12,10,0.45)] backdrop-blur-xl">
+        {/* Header */}
+        <section className="overflow-hidden rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.78)]">
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1.1fr)_320px] lg:items-center">
             <div className="p-6 sm:p-8 lg:p-10">
-              {/* Badges */}
               <div className="mb-6 flex flex-wrap items-center gap-3">
                 <div className="inline-flex rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.22em] text-emerald-200">
                   React + FastAPI
                 </div>
-
-                {/* Server Status Indicator */}
                 <div className={`flex items-center gap-2 rounded-full px-3 py-1 text-xs font-medium ${
                   serverStatus === "online"
                     ? "border border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
@@ -607,7 +658,6 @@ function App() {
                 </div>
               </div>
 
-              {/* Title & Description */}
               <h1 className="text-4xl font-bold tracking-tight text-white sm:text-5xl">
                 AI Product Review Analyzer
               </h1>
@@ -615,18 +665,17 @@ function App() {
                 Analyze product reviews to extract sentiment, pros, cons, and key insights instantly.
               </p>
 
-              {/* Form */}
               <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
                 <label className="block">
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-3 text-sm font-medium text-slate-200">
                     <span>Enter Reviews</span>
                     <div className="flex items-center gap-3">
                       <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
-                        {reviews.length} review{reviews.length === 1 ? "" : "s"}
+                        {reviews.length} entry{reviews.length === 1 ? "" : "s"}
                       </span>
-                      {reviews.length > 0 && (
-                        <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-300">
-                          {reviews.length} unique
+                      {isTruncated && (
+                        <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-xs text-amber-300">
+                          Limited to {MAX_REVIEWS_LIMIT}
                         </span>
                       )}
                     </div>
@@ -639,37 +688,36 @@ function App() {
                       if (error) setError("");
                       if (lowQualityMessage) setLowQualityMessage("");
                     }}
-                    placeholder={`Battery life is excellent and setup was simple.\nThe camera is average for the price.\nPerformance feels slow sometimes.\n\nYou can also use periods to separate reviews!`}
+                    placeholder={`Battery life is excellent and setup was simple.\nThe camera is average for the price.\nPerformance feels slow sometimes.\n\nSeparate reviews with newlines!`}
                     className="min-h-64 w-full rounded-3xl border border-white/10 bg-slate-950/55 px-5 py-4 text-base text-slate-100 outline-none transition focus:border-emerald-300/60 focus:ring-2 focus:ring-emerald-300/20"
                     disabled={loading}
                   />
                   <p className="mt-3 text-xs text-slate-400">
-                    Separate reviews with newlines or periods. Duplicates are automatically removed.
+                    Separate reviews with newlines. Each review must be at least 10 characters with letters.
                   </p>
                 </label>
 
-                {/* Submit Button & Status */}
+                {isTruncated && (
+                  <div className="flex items-center gap-2 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-2 text-sm text-amber-100">
+                    <span>⚠️</span>
+                    <span>Only first {MAX_REVIEWS_LIMIT} of {reviews.length} reviews will be analyzed.</span>
+                  </div>
+                )}
+
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex flex-col gap-1">
                     <div className="text-xs text-slate-500">
                       API: {API_BASE_URL.replace(/^https?:\/\//, "")}
                     </div>
-                    
                     {isInCooldown && !error && (
-                      <div className="text-xs text-amber-300 animate-pulse">
-                        ⏳ Cooldown active... please wait
-                      </div>
+                      <div className="text-xs text-amber-300 animate-pulse">⏳ Cooldown active...</div>
                     )}
-                    
+                    {serverStatus === "offline" && !error && (
+                      <div className="text-xs text-rose-300">🔴 Server is offline.</div>
+                    )}
                     {retryInfo?.status === "retried" && !error && (
                       <div className="text-xs text-emerald-400 animate-pulse">
-                        ✅ Recovered after {retryInfo.retries} auto-retry{retryInfo.retries !== 1 ? "s" : ""}
-                      </div>
-                    )}
-                    
-                    {requestId && loading && (
-                      <div className="text-xs text-cyan-400 font-mono">
-                        ID: {requestId}
+                        ✅ Recovered after {retryInfo.retries} retry{retryInfo.retries !== 1 ? "s" : ""}
                       </div>
                     )}
                   </div>
@@ -695,19 +743,16 @@ function App() {
                 </div>
               </form>
 
-              {/* Messages */}
               {isInputTooShort && !error && !lowQualityMessage && (
                 <div className="mt-5 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
                   {LOW_QUALITY_MESSAGE}
                 </div>
               )}
-
               {error && (
                 <div className="mt-5 rounded-2xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
                   {error}
                 </div>
               )}
-
               {lowQualityMessage && (
                 <div className="mt-5 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
                   {lowQualityMessage}
@@ -715,12 +760,9 @@ function App() {
               )}
             </div>
 
-            {/* Example Section */}
             <div className="px-6 pb-6 sm:px-8 lg:px-0 lg:pr-10">
-              <div className="rounded-[1.75rem] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.03))] p-5 shadow-[0_18px_50px_rgba(4,12,10,0.22)]">
-                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-amber-100/75">
-                  Try Example
-                </p>
+              <div className="rounded-[1.75rem] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.03))] p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-amber-100/75">Try Example</p>
                 <div 
                   className="mt-4 rounded-2xl border border-emerald-300/12 bg-black/15 px-4 py-4 text-sm leading-7 text-slate-100 cursor-pointer hover:bg-black/25 transition"
                   onClick={() => setInputText("The camera is great but battery drains fast. Performance is excellent for the price. Display is bright but could be sharper. Sound quality is average.")}
@@ -732,27 +774,19 @@ function App() {
           </div>
         </section>
 
-        {/* Loading Skeleton */}
         {loading && renderSkeleton()}
 
-        {/* Results Section */}
         {result && hasMeaningfulResult && !isInputTooShort && !lowQualityMessage && !loading && (
-          <section className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-6 shadow-[0_20px_90px_rgba(4,12,10,0.32)] backdrop-blur-xl sm:p-8">
-            {/* Results Header */}
+          <section className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-6 sm:p-8">
             <div className="mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="text-2xl font-semibold text-white">Analysis Result</h2>
-                <p className="mt-1 text-sm text-slate-300">
-                  Response data from the deployed FastAPI backend.
-                </p>
+                <p className="mt-1 text-sm text-slate-300">Response from the FastAPI backend.</p>
               </div>
-
               <button
                 onClick={copyToClipboard}
                 className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition ${
-                  copySuccess
-                    ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
-                    : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20 hover:bg-white/10"
+                  copySuccess ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20"
                 }`}
               >
                 {copySuccess ? (
@@ -773,13 +807,10 @@ function App() {
               </button>
             </div>
 
-            {/* Stats Grid */}
             <div className="mb-6 flex flex-wrap gap-3">
               <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
                 <span className="block text-slate-400">Total Reviews</span>
-                <span className="font-semibold text-slate-100">
-                  {safeResult.sentiment.total || reviews.length}
-                </span>
+                <span className="font-semibold text-slate-100">{safeResult.sentiment.total || reviews.length}</span>
               </div>
               <div className="rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm">
                 <span className="block text-slate-400">Score</span>
@@ -803,51 +834,61 @@ function App() {
               </div>
             </div>
 
-            {/* Content Grid */}
             <div className="grid gap-6 lg:grid-cols-[1fr_0.95fr]">
               <div className="space-y-6">
-                {/* Summary */}
                 <article className="rounded-[1.5rem] border border-white/10 bg-slate-950/35 p-5">
                   <p className="text-sm uppercase tracking-[0.18em] text-emerald-200/80">Summary</p>
                   <p className="mt-3 text-base leading-7 text-slate-100">{safeResult.summary}</p>
                 </article>
 
-                {/* Pros & Cons Grid */}
                 <div className="grid gap-6 md:grid-cols-2">
                   <article className="rounded-[1.5rem] border border-emerald-300/15 bg-emerald-300/8 p-5">
                     <p className="text-sm uppercase tracking-[0.18em] text-emerald-100">Pros</p>
                     {renderList(safeResult.pros, "No pros returned.")}
                   </article>
-
                   <article className="rounded-[1.5rem] border border-rose-300/15 bg-rose-300/8 p-5">
                     <p className="text-sm uppercase tracking-[0.18em] text-rose-100">Cons</p>
                     {renderList(safeResult.cons, "No cons returned.")}
                   </article>
                 </div>
 
-                {/* Neutral Points */}
                 <article className="rounded-[1.5rem] border border-amber-300/15 bg-amber-300/8 p-5">
                   <p className="text-sm uppercase tracking-[0.18em] text-amber-100">Neutral Points</p>
                   {renderList(safeResult.neutral_points, "No neutral feedback found.")}
                 </article>
+
+                {/* ✅ FIXED: Feature Scores with safe extraction */}
+                {safeResult.feature_scores && safeResult.feature_scores.length > 0 && (
+                  <article className="rounded-[1.5rem] border border-cyan-300/15 bg-cyan-300/8 p-5">
+                    <p className="text-sm uppercase tracking-[0.18em] text-cyan-100">Feature Scores</p>
+                    <div className="space-y-1">
+                      {safeResult.feature_scores.map((featureScore, index) => {
+                        const { feature, score } = extractFeatureScore(featureScore);
+                        return renderFeatureScore(feature, score);
+                      })}
+                    </div>
+                  </article>
+                )}
               </div>
 
-              {/* Chart */}
               <div>
                 <p className="mb-4 text-sm uppercase tracking-[0.18em] text-amber-100/80">Sentiment Chart</p>
-                <SentimentChart
-                  positive={safeResult.sentiment.positive}
-                  neutral={safeResult.sentiment.neutral}
-                  negative={safeResult.sentiment.negative}
-                  score={safeResult.score}
-                  confidence={safeResult.confidence}
-                />
+                {safeResult.sentiment.total > 0 ? (
+                  <SentimentChart
+                    positive={safeResult.sentiment.positive}
+                    neutral={safeResult.sentiment.neutral}
+                    negative={safeResult.sentiment.negative}
+                    score={safeResult.score}
+                    confidence={safeResult.confidence}
+                  />
+                ) : (
+                  renderEmptyChart()
+                )}
               </div>
             </div>
           </section>
         )}
 
-        {/* Footer */}
         <footer className="mt-10 text-center text-sm text-slate-400/80">
           Developed by Babul Kumar • Ultra-resilient with auto-retry + timeout
         </footer>

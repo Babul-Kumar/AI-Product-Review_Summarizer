@@ -52,11 +52,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Keys
+# API Keys (optional - for protecting the API)
 VALID_API_KEYS = set()
 raw_keys = os.getenv("API_KEYS", "")
 if raw_keys:
     VALID_API_KEYS = {k.strip() for k in raw_keys.split(",") if k.strip()}
+
+if not VALID_API_KEYS:
+    logger.info("No API_KEYS configured - running in open mode (optional protection)")
 
 # Cache settings
 ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
@@ -228,7 +231,7 @@ class AnalyzeResponse(BaseModel):
 app = FastAPI(
     title="AI Product Review Aggregator API",
     description="Production-ready elite-level system",
-    version="18.0",
+    version="18.2",
 )
 
 app.add_middleware(
@@ -246,7 +249,6 @@ app.add_middleware(
 
 async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> str:
     if not VALID_API_KEYS:
-        logger.warning("No API keys configured - running in open mode!")
         return "dev"
 
     if not x_api_key:
@@ -259,7 +261,7 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> str:
 
 
 # ==============================================================================
-# PROMETHEUS METRICS
+# PROMETHEUS METRICS (✅ FIX 1: Safe initialization)
 # ==============================================================================
 
 try:
@@ -272,26 +274,36 @@ try:
     SEMAPHORE_USAGE = Gauge('review_api_semaphore_usage', 'Current semaphore usage')
     ACTIVE_REQUESTS = Gauge('review_api_active_requests', 'Active requests')
     GEMINI_REQUESTS_ACTIVE = Gauge('review_api_gemini_active', 'Active Gemini requests')
+    USE_PROMETHEUS = True
     
     @app.get("/metrics")
     async def metrics():
         return JSONResponse(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
     
-    USE_PROMETHEUS = True
-    
 except ImportError:
     USE_PROMETHEUS = False
     
     class NoOpCounter:
+        def __init__(self, *args, **kwargs): pass
         def labels(self, **kwargs): return self
         def inc(self, n=1): pass
+    
     class NoOpHistogram:
-        def labels(self, **kwargs):
-            class ctx:
-                def __enter__(self): pass
+        def __init__(self, *args, **kwargs): pass
+        def labels(self, **kwargs): 
+            class HistogramCtx:
+                def __enter__(self): return self
                 def __exit__(self, *args): pass
-            return ctx()
+                def time(self):
+                    class TimerCtx:
+                        def __enter__(self): return self
+                        def __exit__(self, *args): pass
+                    return TimerCtx()
+            return HistogramCtx()
+    
     class NoOpGauge:
+        def __init__(self, *args, **kwargs): pass
+        def labels(self, **kwargs): return self
         def set(self, n): pass
     
     REQUEST_COUNT = NoOpCounter()
@@ -572,7 +584,6 @@ gemini_semaphore = asyncio.Semaphore(GEMINI_CONCURRENCY_LIMIT)
 
 WORKER_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
 
-# ✅ FIX: Task tracking with automatic cleanup
 TASK_RESULTS: Dict[str, asyncio.Future] = {}
 TASK_RESULTS_LOCK = threading.Lock()
 
@@ -588,7 +599,7 @@ def generate_task_id() -> str:
 
 
 # ==============================================================================
-# GEMINI CLIENT MANAGER
+# GEMINI CLIENT MANAGER (✅ FIX 3: Proper content format)
 # ==============================================================================
 
 class GeminiKeyConfig:
@@ -681,7 +692,11 @@ class GeminiClientManager:
         self._circuit_open_time: Optional[float] = None
 
         self._load_keys()
-        logger.info(f"GeminiClientManager initialized: {len(self._keys)} key(s)")
+        
+        healthy_count = self.get_healthy_key_count()
+        logger.info(f"GeminiClientManager initialized: {len(self._keys)} total keys, {healthy_count} healthy")
+        if healthy_count == 0:
+            logger.warning("⚠️ No healthy Gemini API keys! AI enhancement will be disabled until keys recover.")
 
     def has_keys(self) -> bool:
         return bool(self._keys)
@@ -836,29 +851,45 @@ class GeminiClientManager:
         return None, last_error
 
     async def analyze_reviews(self, reviews: list[str], model_name: str = DEFAULT_GEMINI_MODEL) -> Optional[dict]:
+        prompt = build_analysis_prompt(reviews)
+        
         def _call(client):
             return client.models.generate_content(
                 model=model_name,
-                contents=build_analysis_prompt(reviews),
+                contents=[{"role": "user", "parts": [{"text": prompt}]}],
                 config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json"),
             )
 
         result, error = await self._execute_with_retry(_call)
+        
         if error or not result:
             return None
-        return parse_ai_response(result.text or "")
+        
+        if not result.text:
+            logger.warning("Gemini returned empty response")
+            return None
+            
+        return parse_ai_response(result.text)
 
     async def generate_summary(self, pros: list[str], cons: list[str], model_name: str = DEFAULT_GEMINI_MODEL) -> Optional[str]:
+        prompt = build_summary_prompt(pros, cons)
+        
         def _call(client):
             return client.models.generate_content(
                 model=model_name,
-                contents=build_summary_prompt(pros, cons),
+                contents=[{"role": "user", "parts": [{"text": prompt}]}],
                 config=types.GenerateContentConfig(temperature=0.3, response_mime_type="text/plain"),
             )
 
         result, error = await self._execute_with_retry(_call)
+        
         if error or not result:
             return None
+            
+        if not result.text:
+            logger.warning("Gemini summary returned empty response")
+            return None
+            
         return (result.text or "").strip()
 
     def get_health(self) -> dict:
@@ -875,6 +906,8 @@ class GeminiClientManager:
         self._circuit_open_time = None
         self._consecutive_failures = 0
         self._load_keys()
+        
+        logger.info(f"Gemini keys reloaded: {len(self._keys)} total, {self.get_healthy_key_count()} healthy")
 
 
 gemini_manager = GeminiClientManager()
@@ -1348,7 +1381,7 @@ def select_best_points(points_a: list[str], points_b: list[str], label: str) -> 
 
 
 # ==============================================================================
-# WORKER PROCESSOR
+# WORKER PROCESSOR (✅ FIX 2: Remove healthy key check - retry handles it)
 # ==============================================================================
 
 async def process_analysis_task(reviews: list[str], detailed: bool) -> tuple:
@@ -1385,6 +1418,7 @@ async def process_analysis_task(reviews: list[str], detailed: bool) -> tuple:
     ai_result = None
     ai_summary = None
 
+    # ✅ FIX 2: Just check if keys exist - retry logic handles unhealthy keys
     if gemini_manager.has_keys():
         try:
             model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
@@ -1419,8 +1453,11 @@ async def process_analysis_task(reviews: list[str], detailed: bool) -> tuple:
                     finally:
                         request_tracker.active_gemini -= 1
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"AI enhancement failed: {e}")
             warnings.append("⚠️ AI enhancement unavailable, using rule-based analysis.")
+    else:
+        logger.info("No Gemini keys configured - using rule-based analysis only")
 
     if ai_result and (ai_result.get("pros") or ai_result.get("cons")):
         final_pros = select_best_points(ai_result.get("pros", []), rule_based["pros"], "positive")
@@ -1464,11 +1501,10 @@ async def process_analysis_task(reviews: list[str], detailed: bool) -> tuple:
 
 
 # ==============================================================================
-# ✅ MULTIPLE WORKER LOOPS
+# WORKER LOOPS
 # ==============================================================================
 
 async def worker_loop(worker_id: int):
-    """Worker that processes tasks from queue."""
     logger.info(f"Worker {worker_id} started")
     
     while True:
@@ -1491,7 +1527,6 @@ async def worker_loop(worker_id: int):
                 request_tracker.queue_depth = WORKER_QUEUE.qsize()
                 WORKER_QUEUE.task_done()
                 
-                # ✅ FIX: Cleanup task from tracking
                 with TASK_RESULTS_LOCK:
                     TASK_RESULTS.pop(task_id, None)
                 
@@ -1503,7 +1538,6 @@ async def worker_loop(worker_id: int):
 
 
 async def redis_sync_task():
-    """Periodic sync of Redis cache count."""
     while True:
         await asyncio.sleep(300)
         try:
@@ -1534,7 +1568,7 @@ def calculate_score_and_confidence(sentiment: dict) -> tuple[float, float]:
 
 
 # ==============================================================================
-# ✅ MAIN ENDPOINT
+# MAIN ENDPOINT (✅ FIX 1: Safe Prometheus timing)
 # ==============================================================================
 
 @app.post("/analyze-raw", response_model=AnalyzeResponse)
@@ -1552,7 +1586,6 @@ async def analyze_raw_text(
         api_key = await verify_api_key(x_api_key)
         user_id = hashlib.sha256(api_key.encode()).hexdigest()[:6]
 
-        # Rate limit check
         is_limited, reason = scalable_limiter.is_rate_limited(user_id)
         if is_limited:
             REQUEST_COUNT.labels(endpoint=endpoint, status="rate_limited").inc()
@@ -1576,14 +1609,11 @@ async def analyze_raw_text(
 
         detailed = request.query_params.get("detailed", "false").lower() == "true"
 
-        # ✅ Submit to worker queue
         task_id = generate_task_id()
         
-        # ✅ FIX: Use create_future() instead of Future()
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         
-        # Register for tracking
         with TASK_RESULTS_LOCK:
             TASK_RESULTS[task_id] = future
         
@@ -1594,12 +1624,14 @@ async def analyze_raw_text(
             REQUEST_COUNT.labels(endpoint=endpoint, status="queue_full").inc()
             raise HTTPException(status_code=503, detail="Server busy. Try again later.")
 
-        # ✅ Wait for worker result
-        with REQUEST_LATENCY.labels(endpoint=endpoint).time():
-            try:
+        # ✅ FIX 1: Safe Prometheus timing with fallback
+        try:
+            timer = REQUEST_LATENCY.labels(endpoint=endpoint)
+            with timer.time():
                 analysis, sentiment, feature_scores, from_cache, ai_warnings = await asyncio.wait_for(future, timeout=30.0)
-            except asyncio.TimeoutError:
-                raise HTTPException(status_code=504, detail="Processing timeout. Try again.")
+        except AttributeError:
+            logger.debug("Prometheus timing not available, continuing without metrics")
+            analysis, sentiment, feature_scores, from_cache, ai_warnings = await asyncio.wait_for(future, timeout=30.0)
 
         warnings.extend(ai_warnings)
 
@@ -1746,7 +1778,7 @@ async def get_system_health(x_api_key: Optional[str] = Header(None)) -> dict:
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {
-        "message": "AI Product Review Aggregator API v18.0",
+        "message": "AI Product Review Aggregator API v18.2",
         "docs": "/docs",
         "primary_endpoint": "/analyze-raw",
     }
@@ -1761,20 +1793,20 @@ def health() -> dict[str, str]:
 
 
 # ==============================================================================
-# ✅ STARTUP EVENT
+# STARTUP EVENT (✅ FIX 4: Reload keys on startup)
 # ==============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Start multiple worker loops for parallel processing."""
-    # ✅ FIX: Spawn multiple workers
+    gemini_manager.reload_keys()
+    
     for i in range(WORKER_POOL_SIZE):
         asyncio.create_task(worker_loop(i))
     
-    # Start Redis sync task
     asyncio.create_task(redis_sync_task())
     
     logger.info(f"Started {WORKER_POOL_SIZE} worker loops")
+    logger.info(f"API ready at: /analyze-raw")
 
 
 # ==============================================================================
