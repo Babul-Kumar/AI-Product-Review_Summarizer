@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 import hashlib
 import json
 import logging
@@ -1943,7 +1944,7 @@ async def _handle_analyze(
         raise
     except Exception as exc:
         REQUEST_COUNT.labels(endpoint=endpoint, status="error").inc()
-        logger.error(f"ANALYTICS | error | {str(exc)}")
+        logger.error("ANALYTICS ERROR", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         request_tracker.active_http -= 1
