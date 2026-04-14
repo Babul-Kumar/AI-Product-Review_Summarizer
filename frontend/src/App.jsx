@@ -6,8 +6,8 @@ import SentimentChart from "./components/SentimentChart";
 // ==============================================================================
 
 const LOG_LEVEL = {
-  DEBUG: import.meta.env.DEV,
-  INFO: true,
+  DEBUG: false,
+  INFO: false,
   WARN: true,
   ERROR: true,
 };
@@ -22,24 +22,21 @@ const log = {
 // Environment Variables
 const API_BASE_URL = import.meta.env.VITE_API_URL || "https://ai-product-review.onrender.com";
 const ANALYZE_URL = `${API_BASE_URL}/analyze-raw`;
-const ANALYZE_STREAM_URL = `${API_BASE_URL}/analyze-stream`; // ✅ New streaming endpoint
+const ANALYZE_STREAM_URL = `${API_BASE_URL}/analyze-stream`;
 const PING_URL = `${API_BASE_URL}/ping`;
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 
 // Constants
-const MIN_REVIEW_INPUT_LENGTH = 10;
-const LOW_QUALITY_MESSAGE = "Please enter meaningful product reviews to get accurate insights.";
 const COOLDOWN_MS = 3000;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_BASE = 1500;
 const REQUEST_TIMEOUT_MS = 20000;
 const HEALTH_CHECK_INTERVAL = 30000;
-const MAX_REVIEWS_LIMIT = 5;
 const CACHE_TTL = 120000;
 const MAX_INPUT_LENGTH = 5000;
 const SLOW_LOADING_THRESHOLD = 5000;
 
-// ✅ STREAMING: Stage configurations
+// STREAMING: Stage configurations
 const STREAM_STAGES = {
   SUMMARY: { order: 0, name: "summary", icon: "📝", label: "Generating summary..." },
   PROS: { order: 1, name: "pros", icon: "👍", label: "Extracting pros..." },
@@ -49,17 +46,6 @@ const STREAM_STAGES = {
   SENTIMENT: { order: 5, name: "sentiment", icon: "📊", label: "Analyzing sentiment..." },
   COMPLETE: { order: 6, name: "complete", icon: "✅", label: "Complete!" },
 };
-
-// Non-meaningful patterns
-const NON_MEANINGFUL_PATTERNS = [
-  /^no summary was returned\.?$/i,
-  /^no major recurring strengths were mentioned\.?$/i,
-  /^no major recurring complaints were mentioned\.?$/i,
-  /^no neutral feedback found\.?$/i,
-  /^no valid review content found\.?$/i,
-  /^please provide at least one non-empty review\.?$/i,
-  /^input does not appear to be product reviews\.?$/i,
-];
 
 const EMPTY_RESULT = {
   summary: "",
@@ -78,11 +64,18 @@ const EMPTY_RESULT = {
 
 if (typeof window !== "undefined") {
   window.addEventListener("error", (e) => {
-    log.error("💥 Global error:", e.error?.message || e.message);
+    const msg = typeof e.error?.message === "string"
+      ? e.error.message
+      : e.error?.message || String(e.error?.message || e.message);
+    log.error("💥 Global error:", msg);
   });
 
   window.addEventListener("unhandledrejection", (e) => {
-    log.error("💥 Unhandled promise rejection:", e.reason?.message || e.reason);
+    const reason = e.reason;
+    const msg = typeof reason === "string"
+      ? reason
+      : reason?.message || JSON.stringify(reason);
+    log.error("💥 Unhandled promise rejection:", msg);
   });
 }
 
@@ -114,20 +107,22 @@ function normalizeResult(data) {
     summary: typeof data?.summary === "string" && data.summary.trim()
       ? data.summary.trim()
       : "No summary was returned.",
-    pros: toSafeList(data?.pros),
-    cons: toSafeList(data?.cons),
-    neutral_points: toSafeList(data?.neutral_points),
+    pros: toSafeList(data?.pros ?? []),
+    cons: toSafeList(data?.cons ?? []),
+    neutral_points: toSafeList(data?.neutral_points ?? []),
     sentiment: {
-      positive: toSafeNumber(sentiment.positive),
-      neutral: toSafeNumber(sentiment.neutral),
-      negative: toSafeNumber(sentiment.negative),
-      total: toSafeNumber(sentiment.total),
+      positive: toSafeNumber(sentiment?.positive ?? 0),
+      neutral: toSafeNumber(sentiment?.neutral ?? 0),
+      negative: toSafeNumber(sentiment?.negative ?? 0),
+      total: toSafeNumber(sentiment?.total ?? 0),
     },
-    score: toSafeNumber(data?.score),
-    confidence: toSafeNumber(data?.confidence),
+    score: toSafeNumber(data?.score ?? 0),
+    confidence: toSafeNumber(data?.confidence ?? 0),
     explained_pros: Array.isArray(data?.explained_pros) ? data.explained_pros : [],
     explained_cons: Array.isArray(data?.explained_cons) ? data.explained_cons : [],
-    feature_scores: Array.isArray(data?.feature_scores) ? data.feature_scores : [],
+    feature_scores: Array.isArray(data?.feature_scores)
+      ? data.feature_scores.filter(isValidFeatureScore)
+      : [],
   };
 }
 
@@ -142,15 +137,14 @@ function formatScore(value) {
 
 function isMeaningfulItem(item) {
   const text = String(item ?? "").trim();
-  return text.length > 0 && !NON_MEANINGFUL_PATTERNS.some((pattern) => pattern.test(text));
+  return text.length > 0;
 }
 
 function hasMeaningfulInsights(data) {
-  return data.pros.some(isMeaningfulItem) || data.cons.some(isMeaningfulItem);
-}
-
-function isMeaningfulReview(text) {
-  return text.length > 10 && /[a-zA-Z]/.test(text);
+  if (!data) return false;
+  const hasPros = Array.isArray(data.pros) && data.pros.some(isMeaningfulItem);
+  const hasCons = Array.isArray(data.cons) && data.cons.some(isMeaningfulItem);
+  return hasPros || hasCons;
 }
 
 function extractFeatureScore(featureScore) {
@@ -185,42 +179,14 @@ function isValidFeatureScore(featureScore) {
   return true;
 }
 
-function compressReviews(reviews) {
-  return reviews.slice(0, MAX_REVIEWS_LIMIT).map(review => {
-    if (review.length > 200) {
-      return review.substring(0, 200) + "...";
-    }
-    return review;
-  });
-}
-
-function analyzeReviewLine(line, index) {
-  const trimmed = line.trim();
-  const isTooShort = trimmed.length > 0 && trimmed.length < 10;
-  const hasNoLetters = trimmed.length > 0 && !/[a-zA-Z]/.test(trimmed);
-  const isEmpty = trimmed.length === 0;
-  
-  return {
-    index,
-    original: line,
-    trimmed,
-    isValid: !isEmpty && !isTooShort && !hasNoLetters && trimmed.length >= 10,
-    isTooShort,
-    hasNoLetters,
-    isEmpty,
-    status: isEmpty ? "skipped" : isTooShort ? "invalid" : hasNoLetters ? "invalid" : "valid"
-  };
-}
-
-// ✅ STREAMING: Create initial partial result structure
 function createPartialResult() {
   return {
-    summary: null,           // First - fastest
-    pros: null,              // Second
-    cons: null,              // Third
-    neutral_points: null,    // Fourth
-    feature_scores: null,    // Fifth
-    sentiment: null,         // Last - slowest
+    summary: null,
+    pros: null,
+    cons: null,
+    neutral_points: null,
+    feature_scores: null,
+    sentiment: null,
     score: null,
     confidence: null,
     _meta: {
@@ -230,38 +196,42 @@ function createPartialResult() {
   };
 }
 
-// ✅ STREAMING: Update partial result
 function updatePartialResult(current, type, data) {
-  const newResult = { ...current };
+  const newResult = { 
+    ...current,
+    _meta: current._meta ? { ...current._meta } : { completedStages: [], streaming: true }
+  };
+  
+  const alreadyTracked = newResult._meta.completedStages.includes(type);
   
   switch (type) {
     case "summary":
       newResult.summary = data;
       break;
     case "pros":
-      newResult.pros = toSafeList(data);
+      newResult.pros = toSafeList(data ?? []);
       break;
     case "cons":
-      newResult.cons = toSafeList(data);
+      newResult.cons = toSafeList(data ?? []);
       break;
     case "neutral_points":
-      newResult.neutral_points = toSafeList(data);
+      newResult.neutral_points = toSafeList(data ?? []);
       break;
     case "feature_scores":
       newResult.feature_scores = Array.isArray(data) ? data : [];
       break;
     case "sentiment":
       newResult.sentiment = data;
-      newResult.score = toSafeNumber(data?.score);
-      newResult.confidence = toSafeNumber(data?.confidence);
+      newResult.score = toSafeNumber(data?.score ?? 0);
+      newResult.confidence = toSafeNumber(data?.confidence ?? 0);
       break;
     case "complete":
-      newResult._meta.completedStages.push(type);
       break;
   }
   
-  if (!newResult._meta) newResult._meta = { completedStages: [], streaming: true };
-  newResult._meta.completedStages.push(type);
+  if (!alreadyTracked) {
+    newResult._meta.completedStages.push(type);
+  }
   
   return newResult;
 }
@@ -270,15 +240,17 @@ function updatePartialResult(current, type, data) {
 // FETCH UTILITIES
 // ==============================================================================
 
+// ✅ FIX 3: Use options.signal OR controller.signal
 function fetchWithTimeout(url, options, timeout = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
   }, timeout);
 
+  // ✅ FIX 3: Preserve incoming signal if provided
   return fetch(url, {
     ...options,
-    signal: controller.signal,
+    signal: options.signal || controller.signal,
   }).finally(() => clearTimeout(timeoutId));
 }
 
@@ -325,12 +297,15 @@ async function fetchWithRetry(url, options, retries = MAX_RETRIES, retryCount = 
   }
 }
 
-// ✅ STREAMING: Stream fetch with progressive updates
-async function fetchWithStreaming(url, options, onChunk, onStage, signal, requestId) {
+async function fetchWithStreaming(url, options, onChunk, onStage, signal, requestId, onFallback) {
   const startTime = Date.now();
   
   try {
-    const response = await fetch(url, {
+    if (signal?.aborted) {
+      throw { isAbort: true, message: "Request cancelled" };
+    }
+    
+    const response = await fetchWithTimeout(url, {
       ...options,
       signal,
     });
@@ -348,33 +323,41 @@ async function fetchWithStreaming(url, options, onChunk, onStage, signal, reques
     }
 
     while (true) {
+      if (signal?.aborted) {
+        reader.cancel();
+        throw { isAbort: true, message: "Request cancelled" };
+      }
+      
       const { done, value } = await reader.read();
       
       if (done) break;
       
       buffer += decoder.decode(value, { stream: true });
       
-      // Process complete JSON lines
       const lines = buffer.split("\n");
-      buffer = lines.pop() || ""; // Keep incomplete line in buffer
+      buffer = lines.length > 0 ? lines.pop() : "";
       
       for (const line of lines) {
-        if (!line.trim() || line.trim() === "[DONE]") continue;
+        const clean = line.trim();
+        if (!clean || clean.toUpperCase() === "[DONE]") continue;
         
+        let parsed;
         try {
-          const parsed = JSON.parse(line);
-          const { type, data } = parsed;
-          
-          log.debug(`[Stream:${type}]`, data);
-          onChunk(type, data);
-          
-          // Notify current stage
-          const stage = STREAM_STAGES[type.toUpperCase()] || STREAM_STAGES[type];
-          if (stage) {
-            onStage(stage, data);
-          }
+          // ✅ FIX 4: Parse clean instead of line
+          parsed = JSON.parse(clean);
         } catch (e) {
-          // Ignore parse errors for incomplete chunks
+          log.debug(`[Stream] Skipped malformed JSON: ${clean.substring(0, 50)}...`);
+          continue;
+        }
+        
+        const { type, data } = parsed;
+        
+        log.debug(`[Stream:${type}]`, data);
+        onChunk(type, data);
+        
+        const stage = STREAM_STAGES[type.toUpperCase()] || STREAM_STAGES[type];
+        if (stage) {
+          onStage(stage, data);
         }
       }
     }
@@ -383,11 +366,40 @@ async function fetchWithStreaming(url, options, onChunk, onStage, signal, reques
     return { success: true, duration };
 
   } catch (error) {
-    if (error.name === "AbortError") {
+    if (error.isAbort || error.name === "AbortError") {
       throw { isAbort: true, message: "Request cancelled" };
+    }
+    
+    if (onFallback) {
+      onFallback(error.message);
     }
     throw error;
   }
+}
+
+// ==============================================================================
+// HELPER: Safe message extraction
+// ==============================================================================
+
+function extractMessage(data) {
+  const rawMessage = data?.detail || data?.message || null;
+  
+  if (!rawMessage) {
+    return { message: "Unknown error", errorCode: null };
+  }
+  
+  if (typeof rawMessage === "string") {
+    return { message: rawMessage, errorCode: null };
+  }
+  
+  if (typeof rawMessage === "object") {
+    return {
+      message: rawMessage?.message || rawMessage?.msg || JSON.stringify(rawMessage),
+      errorCode: rawMessage?.error || rawMessage?.code || rawMessage?.type || null
+    };
+  }
+  
+  return { message: String(rawMessage), errorCode: null };
 }
 
 // ==============================================================================
@@ -399,8 +411,7 @@ function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [lowQualityMessage, setLowQualityMessage] = useState("");
-  const [serverStatus, setServerStatus] = useState("online");
+  const [serverStatus, setServerStatus] = useState("checking");
   const [lastClickTime, setLastClickTime] = useState(0);
   const [copySuccess, setCopySuccess] = useState(false);
   const [retryInfo, setRetryInfo] = useState(null);
@@ -409,8 +420,9 @@ function App() {
   const [isSlowLoading, setIsSlowLoading] = useState(false);
   const [analysisStats, setAnalysisStats] = useState(null);
   const [showStats, setShowStats] = useState(false);
-  
-  // ✅ STREAMING: New state for streaming
+  const [streamingFallback, setStreamingFallback] = useState(false);
+  const streamingFallbackTimerRef = useRef(null);
+
   const [isStreaming, setIsStreaming] = useState(false);
   const [currentStage, setCurrentStage] = useState(null);
   const [stageProgress, setStageProgress] = useState({});
@@ -434,28 +446,32 @@ function App() {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
+      if (streamingFallbackTimerRef.current) {
+        clearTimeout(streamingFallbackTimerRef.current);
+      }
     };
   }, []);
 
+  // ✅ FIX 10: Add timeout to health check
   useEffect(() => {
     const checkServerHealth = async () => {
       try {
-        const res = await fetch(PING_URL, { method: "GET" });
+        const res = await fetchWithTimeout(PING_URL, { method: "GET" }, 5000);
 
-        // Only update if success
-        if (res.ok && isMountedRef.current) {
-          setServerStatus("online");
+        if (isMountedRef.current) {
+          setServerStatus(res.ok ? "online" : "offline");
         }
       }
-        
       catch {
-        // ❌ DO NOTHING on failure
-        // Avoid false offline due to cold start
-        console.warn("Ping failed - ignoring");
+        if (isMountedRef.current) {
+          setServerStatus("offline");
+        }
       }
     };
 
     checkServerHealth();
+    const intervalId = setInterval(checkServerHealth, HEALTH_CHECK_INTERVAL);
+    return () => clearInterval(intervalId);
   }, []);
 
   useEffect(() => {
@@ -466,7 +482,6 @@ function App() {
       return;
     }
 
-    // Non-streaming loading stages
     const steps = [
       "📥 Reading reviews...",
       "🧠 Understanding context...",
@@ -497,16 +512,30 @@ function App() {
     };
   }, [loading, isStreaming]);
 
+  // ✅ FIX 1: Proper cleanup for both timeouts
   useEffect(() => {
     if (result) {
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         document.getElementById("result-section")?.scrollIntoView({
           behavior: "smooth",
           block: "start"
         });
+
         setShowStats(true);
-        setTimeout(() => setShowStats(false), 3000);
+
+        // ✅ FIX 1: Inner timeout with cleanup
+        const hideTimer = setTimeout(() => {
+          if (isMountedRef.current) {
+            setShowStats(false);
+          }
+        }, 3000);
+
+        // Return cleanup for inner timeout
+        return () => clearTimeout(hideTimer);
       }, 100);
+      
+      // Cleanup for outer timeout
+      return () => clearTimeout(timer);
     }
   }, [result]);
 
@@ -514,49 +543,30 @@ function App() {
   // HELPERS
   // ==============================================================================
 
-  const getCleanedReviews = useCallback((text) => {
-    return text
+  const reviews = useMemo(() => {
+    return inputText
       .split(/\n+/)
-      .map((line) => line.trim())
-      .filter((line) => isMeaningfulReview(line));
-  }, []);
-
-  const reviewLines = useMemo(() => {
-    if (!inputText.trim()) return [];
-    const lines = inputText.split(/\n+/).map((line, idx) => 
-      analyzeReviewLine(line, idx)
-    );
-    return lines;
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
   }, [inputText]);
-
-  const reviews = useMemo(() => getCleanedReviews(inputText), [inputText, getCleanedReviews]);
-  
-  const reviewStats = useMemo(() => {
-    const valid = reviewLines.filter(r => r.status === "valid").length;
-    const invalid = reviewLines.filter(r => r.status === "invalid").length;
-    const skipped = reviewLines.filter(r => r.status === "skipped").length;
-    return { total: reviewLines.length, valid, invalid, skipped };
-  }, [reviewLines]);
   
   const safeResult = result ?? EMPTY_RESULT;
   const trimmedInput = inputText.trim();
-  const isInputTooShort = trimmedInput.length > 0 && trimmedInput.length < MIN_REVIEW_INPUT_LENGTH;
   const hasMeaningfulResult = result ? hasMeaningfulInsights(result) : false;
   const isInCooldown = Date.now() - lastClickTime < COOLDOWN_MS;
-  const isTruncated = reviews.length > MAX_REVIEWS_LIMIT;
   
-  // ✅ STREAMING: Check if we have partial content to show
   const hasPartialContent = result && (
-    result.summary || 
-    result.pros || 
-    result.cons
+    (result.summary?.length ?? 0) > 0 ||
+    (result.pros?.length ?? 0) > 0 ||
+    (result.cons?.length ?? 0) > 0
   );
 
+  const hasInput = trimmedInput.length > 0;
+  
   const isAnalyzeDisabled = 
-    loading || 
-    reviews.length === 0 || 
-    trimmedInput.length < MIN_REVIEW_INPUT_LENGTH || 
-    isInCooldown || 
+    loading ||
+    !hasInput ||
+    isInCooldown ||
     serverStatus === "offline";
 
   // ==============================================================================
@@ -570,6 +580,7 @@ function App() {
       return;
     }
 
+    // ✅ FIX 9: Safe copy with fallback value
     const textToCopy = JSON.stringify({
       summary: safeResult.summary,
       pros: safeResult.pros,
@@ -579,7 +590,7 @@ function App() {
       score: safeResult.score,
       confidence: safeResult.confidence,
       feature_scores: safeResult.feature_scores,
-      analysisTime: analysisStats?.duration,
+      analysisTime: analysisStats?.duration || 0,
     }, null, 2);
 
     navigator.clipboard.writeText(textToCopy).then(() => {
@@ -600,36 +611,50 @@ function App() {
 
   const handleInputChange = (e) => {
     const value = e.target.value;
+    
     if (value.length > MAX_INPUT_LENGTH) {
-      setError(`Input too long. Maximum ${MAX_INPUT_LENGTH} characters allowed.`);
+      setInputText(value.slice(0, MAX_INPUT_LENGTH));
+      setError(`Input truncated to ${MAX_INPUT_LENGTH} characters.`);
       return;
     }
+    
     setInputText(value);
-    if (error) setError("");
-    if (lowQualityMessage) setLowQualityMessage("");
+    setError("");
   };
 
-  // ✅ STREAMING: Handler for streaming chunks
   const handleStreamChunk = useCallback((type, data) => {
     setResult(prev => {
-      const current = prev || createPartialResult();
-      return updatePartialResult(current, type, data);
+      const base = prev ?? createPartialResult();
+      return updatePartialResult({ ...base }, type, data);
     });
     
-    // Update stage progress
     setStageProgress(prev => ({
       ...prev,
       [type]: "complete"
     }));
   }, []);
 
-  // ✅ STREAMING: Handler for stage changes
   const handleStreamStage = useCallback((stage, data) => {
     setCurrentStage(stage);
     setStageProgress(prev => ({
       ...prev,
       [stage.name]: "loading"
     }));
+  }, []);
+
+  const handleStreamingFallback = useCallback((errorMessage) => {
+    setStreamingFallback(true);
+    log.warn("[Streaming] Falling back to regular request:", errorMessage);
+    
+    if (streamingFallbackTimerRef.current) {
+      clearTimeout(streamingFallbackTimerRef.current);
+    }
+    
+    streamingFallbackTimerRef.current = setTimeout(() => {
+      if (isMountedRef.current) {
+        setStreamingFallback(false);
+      }
+    }, 5000);
   }, []);
 
   const analyzeReviews = async () => {
@@ -642,46 +667,32 @@ function App() {
     const newRequestId = `REQ-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     requestIdRef.current = newRequestId;
 
-    const cleanedReviews = getCleanedReviews(inputText);
-    const limitedReviews = cleanedReviews.slice(0, MAX_REVIEWS_LIMIT);
+    const rawReviews = reviews;
 
-    if (cleanedReviews.length === 0) {
-      setError("Please enter at least one valid review (minimum 10 characters with letters).");
-      setLowQualityMessage("");
-      setRetryInfo(null);
-      return;
-    }
-
-    if (trimmedInput.length < MIN_REVIEW_INPUT_LENGTH) {
-      setError("");
-      setLowQualityMessage(LOW_QUALITY_MESSAGE);
-      setRetryInfo(null);
+    if (rawReviews.length === 0) {
+      setError("Please enter at least one review or piece of text to analyze.");
       return;
     }
 
     const now = Date.now();
     if (now - lastClickTime < COOLDOWN_MS) {
       setError("Too many requests. Please wait a few seconds.");
-      setLowQualityMessage("");
-      setRetryInfo(null);
       return;
     }
     setLastClickTime(now);
 
-    const requestKey = JSON.stringify(limitedReviews);
-
-    if (
+    const requestKey = JSON.stringify(rawReviews.map(r => r.trim().toLowerCase()));
+    const cacheValid = 
       requestKey === lastRequestKeyRef.current &&
       lastResultRef.current &&
-      Date.now() - lastCacheTimeRef.current < CACHE_TTL
-    ) {
+      Date.now() - lastCacheTimeRef.current < CACHE_TTL;
+
+    if (cacheValid) {
       setError("");
-      setUsingCachedResult(false);
+      setUsingCachedResult(true);
+      
       if (hasMeaningfulInsights(lastResultRef.current)) {
-        setLowQualityMessage("");
         setResult(lastResultRef.current);
-      } else {
-        setLowQualityMessage(LOW_QUALITY_MESSAGE);
       }
       setRetryInfo(null);
       return;
@@ -692,16 +703,14 @@ function App() {
 
     setLoading(true);
     setError("");
-    setLowQualityMessage("");
     setUsingCachedResult(false);
     setRetryInfo({ retries: 0, maxRetries: MAX_RETRIES, status: "connecting" });
     setShowStats(false);
-    setIsStreaming(false);
     setCurrentStage(null);
     setStageProgress({});
+    setStreamingFallback(false);
     inFlightRef.current = true;
 
-    const compressedReviews = compressReviews(limitedReviews);
     const startTime = Date.now();
     
     const analysisTimerLabel = `analysis-${newRequestId}`;
@@ -711,147 +720,166 @@ function App() {
     const headers = { "Content-Type": "application/json" };
     if (API_KEY) headers["X-API-Key"] = API_KEY;
 
-    // Try streaming first, fall back to regular
     const fetchOptions = {
       method: "POST",
       headers,
       body: JSON.stringify({ 
-        raw_text: compressedReviews.join("\n"),
-        reviews: compressedReviews,
-        domain: "auto"
+        raw_text: inputText.trim()
       }),
     };
 
     try {
-      // ✅ STREAMING: Try streaming endpoint first
-      let useStreaming = false;
+      setIsStreaming(true);
       
-      try {
-        const streamResult = await fetchWithStreaming(
-          ANALYZE_STREAM_URL,
-          fetchOptions,
-          handleStreamChunk,
-          handleStreamStage,
-          controller.signal,
-          newRequestId
-        );
-        
-        if (streamResult.success) {
-          useStreaming = true;
-          setIsStreaming(true);
-          const duration = Date.now() - startTime;
-          console.timeEnd(analysisTimerLabel);
-          
-          const stats = {
-            duration,
-            streaming: true,
-            reviewsAnalyzed: compressedReviews.length,
-          };
-          
-          setAnalysisStats(stats);
-          lastRequestKeyRef.current = requestKey;
-          lastResultRef.current = result;
-          lastCacheTimeRef.current = Date.now();
-          log.info(`[Analytics] ✅ Streaming completed:`, stats);
-          
-          setRetryInfo(null);
-          setLoading(false);
-          return;
-        }
-      } catch (streamError) {
-        log.warn("[Streaming] Fallback to regular request:", streamError.message);
-        // Fall through to regular request
-      }
-
-      // ✅ Regular (non-streaming) request as fallback
-      setIsStreaming(false);
-      
-      const { response, retriesUsed } = await fetchWithRetry(
-        ANALYZE_URL, fetchOptions, MAX_RETRIES, 0, newRequestId
+      const streamResult = await fetchWithStreaming(
+        ANALYZE_STREAM_URL,
+        fetchOptions,
+        handleStreamChunk,
+        handleStreamStage,
+        controller.signal,
+        newRequestId,
+        handleStreamingFallback
       );
-
-      setRetryInfo((prev) => prev ? { ...prev, retries: retriesUsed, status: retriesUsed > 0 ? "retried" : "success" } : null);
-
-      if (controller.signal.aborted) {
-        setError("Request was cancelled. Please try again.");
-        setLoading(false);
-        inFlightRef.current = false;
+      
+      if (streamResult.success) {
+        const duration = Date.now() - startTime;
         console.timeEnd(analysisTimerLabel);
+        
+        const stats = {
+          duration,
+          streaming: true,
+          reviewsAnalyzed: rawReviews.length,
+        };
+        
+        setAnalysisStats(stats);
+        
+        // ✅ FIX 6: Check for sentiment.total specifically
+        setResult(prev => {
+          if (!prev || !prev.sentiment || prev.sentiment.total === undefined) return prev;
+          const normalizedResult = normalizeResult(prev);
+          lastRequestKeyRef.current = requestKey;
+          lastResultRef.current = normalizedResult;
+          lastCacheTimeRef.current = Date.now();
+          return normalizedResult;
+        });
+        
+        log.info(`[Analytics] ✅ Streaming completed:`, stats);
+        
+        setRetryInfo(null);
+        
+        if (isMountedRef.current) {
+          setIsStreaming(false);
+          setLoading(false);
+        }
         return;
       }
-
-      const responseText = await response.text();
-      let data = null;
-
-      if (responseText) {
-        try {
-          data = JSON.parse(responseText);
-        } catch {
-          throw new Error("The server returned invalid JSON.");
-        }
+    } catch (streamError) {
+      if (!streamError.isAbort) {
+        handleStreamingFallback(streamError.message);
+        // ✅ FIX 2: Abort controller to prevent double request
+        controller.abort();
       }
+      log.warn("[Streaming] Fallback to regular request:", streamError.message);
+    }
 
-      if (!response.ok) {
-        const message = data?.detail || data?.message || `Server error (${response.status})`;
-        let userMessage = message;
-        let errorType = "generic";
+    // ✅ FIX 5: DON'T set streaming false here - let fallback finish naturally
+    // REMOVED: setIsStreaming(false);
+    
+    const { response, retriesUsed } = await fetchWithRetry(
+      ANALYZE_URL, fetchOptions, MAX_RETRIES, 0, newRequestId
+    );
 
-        if (response.status === 422) {
-          userMessage = "⚠️ Invalid input format. Please enter proper reviews.";
-          errorType = "validation";
-        } else if (message.toLowerCase().includes("no api keys") || message.toLowerCase().includes("api key")) {
-          userMessage = "🔑 Backend API keys not configured. Please try again later.";
-          errorType = "config";
-        } else if (message.toLowerCase().includes("gemini")) {
-          userMessage = "🤖 AI processing failed. Server may be busy — please try again.";
-          errorType = "ai";
-        } else if (message.toLowerCase().includes("queue") && message.toLowerCase().includes("full")) {
-          userMessage = "⚠️ Server queue is full. Please wait and try again.";
-          errorType = "queue";
-        } else if (response.status === 429) {
-          userMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
-          errorType = "rate_limit";
-        } else if (response.status >= 500) {
-          userMessage = "🛠️ Server error. The team has been notified.";
-          errorType = "server";
-        }
+    setRetryInfo((prev) => prev ? { ...prev, retries: retriesUsed, status: retriesUsed > 0 ? "retried" : "success" } : null);
 
-        log.error(`[Error:${errorType}] ${message}`);
-        throw new Error(userMessage);
-      }
-
-      if (!data || typeof data !== "object") {
-        throw new Error("The server returned an empty response.");
-      }
-
-      const normalizedData = normalizeResult(data);
-      lastRequestKeyRef.current = requestKey;
-      lastResultRef.current = normalizedData;
-      lastCacheTimeRef.current = Date.now();
-
-      const endTime = Date.now();
-      const duration = endTime - startTime;
+    if (controller.signal.aborted) {
+      setError("Request was cancelled. Please try again.");
+      setLoading(false);
+      inFlightRef.current = false;
       console.timeEnd(analysisTimerLabel);
-      
-      const stats = {
-        duration,
-        retriesUsed,
-        reviewsAnalyzed: compressedReviews.length,
-        responseSize: responseText.length,
-        cached: false,
-        streaming: false,
-      };
-      
-      setAnalysisStats(stats);
-      log.info(`[Analytics] ✅ Analysis completed:`, stats);
+      return;
+    }
 
-      if (hasMeaningfulInsights(normalizedData)) {
-        setLowQualityMessage("");
-        setResult(normalizedData);
-      } else {
-        setLowQualityMessage(LOW_QUALITY_MESSAGE);
+    const responseText = await response.text();
+    let data = null;
+
+    if (responseText) {
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        throw new Error("The server returned invalid JSON.");
       }
-      setRetryInfo(null);
+    }
+
+    if (!response.ok) {
+      const { message, errorCode } = extractMessage(data);
+      let userMessage = message;
+      let errorType = "generic";
+
+      if (response.status === 422) {
+        userMessage = "⚠️ Invalid input format. Please try different text.";
+        errorType = "validation";
+      }
+      else if (errorCode === "INVALID_API_KEY") {
+        userMessage = "🔑 Backend API keys not configured. Please try again later.";
+        errorType = "config";
+      }
+      else if (errorCode === "OUT_OF_SCOPE") {
+        userMessage = "❌ Input is not a valid product review. Please provide text to analyze.";
+        errorType = "validation";
+      }
+      else if (errorCode === "AI_PROCESSING_FAILED" || errorCode === "GEMINI_ERROR") {
+        userMessage = "🤖 AI processing failed. Server may be busy — please try again.";
+        errorType = "ai";
+      }
+      else if (errorCode === "QUEUE_FULL" || errorCode === "RATE_LIMITED") {
+        userMessage = "⚠️ Server queue is full. Please wait and try again.";
+        errorType = "queue";
+      }
+      else if (response.status === 429) {
+        userMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
+        errorType = "rate_limit";
+      }
+      else if (response.status >= 500) {
+        userMessage = "🛠️ Server error. The team has been notified.";
+        errorType = "server";
+      }
+
+      log.error(`[Error:${errorType}] ${message} (code: ${errorCode})`);
+      throw new Error(userMessage);
+    }
+
+    if (!data || typeof data !== "object") {
+      throw new Error("The server returned an empty response.");
+    }
+
+    const normalizedData = normalizeResult(data);
+    
+    lastRequestKeyRef.current = requestKey;
+    lastResultRef.current = normalizedData;
+    lastCacheTimeRef.current = Date.now();
+
+    const endTime = Date.now();
+    const duration = endTime - startTime;
+    console.timeEnd(analysisTimerLabel);
+    
+    const stats = {
+      duration,
+      retriesUsed,
+      reviewsAnalyzed: rawReviews.length,
+      responseSize: responseText.length,
+      cached: false,
+      streaming: false,
+    };
+    
+    setAnalysisStats(stats);
+    log.info(`[Analytics] ✅ Analysis completed:`, stats);
+
+    if (hasMeaningfulInsights(normalizedData)) {
+      setResult(normalizedData);
+    } else {
+      setError("The analysis didn't return meaningful results. Try with different text.");
+    }
+    setRetryInfo(null);
 
     } catch (requestError) {
       if (controller.signal.aborted || requestError.isAbort) {
@@ -867,7 +895,7 @@ function App() {
       const errorText = requestError.message || String(requestError);
 
       if (requestError.isTimeout || errorText.includes("timed out") || errorText.includes("timeout")) {
-        errorMessage = "⏱️ AI is taking longer than usual. Please try again or reduce the number of reviews.";
+        errorMessage = "⏱️ AI is taking longer than usual. Please try again.";
         errorType = "timeout";
       } else if (
         errorText.includes("Failed to fetch") ||
@@ -875,7 +903,7 @@ function App() {
         errorText.includes("fetch failed") ||
         errorText.includes("network")
       ) {
-        errorMessage = "🔌 Network issue detected. Please check your connection and try again.";
+        errorMessage = "🔌 Network issue detected. Please check your connection.";
         errorType = "network";
       } else if (errorText.includes("429")) {
         errorMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
@@ -894,7 +922,6 @@ function App() {
         log.warn("[Fallback] Using cached result due to error:", errorType);
         setError("");
         setUsingCachedResult(true);
-        setLowQualityMessage("");
         setResult(lastResultRef.current);
         setRetryInfo(null);
       } else {
@@ -907,6 +934,7 @@ function App() {
         setIsStreaming(false);
         setCurrentStage(null);
         inFlightRef.current = false;
+        // ✅ FIX 7: Use null for consistency
         abortControllerRef.current = null;
       }
     }
@@ -978,7 +1006,7 @@ function App() {
     <div className="flex h-64 flex-col items-center justify-center rounded-2xl border border-white/10 bg-slate-950/20">
       <div className="text-4xl mb-3">📊</div>
       <p className="text-sm text-slate-400">No sentiment data available</p>
-      <p className="text-xs text-slate-500 mt-1">Submit reviews to see the chart</p>
+      <p className="text-xs text-slate-500 mt-1">Submit text to see the chart</p>
     </div>
   );
 
@@ -1004,7 +1032,6 @@ function App() {
     </section>
   );
 
-  // ✅ STREAMING: Progressive loading indicator
   const renderStreamingProgress = () => (
     <section className="rounded-[2rem] border border-emerald-400/20 bg-[rgba(7,23,19,0.72)] p-6 sm:p-8">
       <div className="mb-6">
@@ -1015,9 +1042,14 @@ function App() {
         <p className="mt-1 text-sm text-emerald-300/80">
           Processing in real-time...
         </p>
+        
+        {streamingFallback && (
+          <div className="mt-2 text-xs text-amber-300 animate-pulse">
+            ⚠️ Streaming unavailable, using standard mode...
+          </div>
+        )}
       </div>
 
-      {/* Stage Progress */}
       <div className="space-y-3 mb-8">
         {Object.values(STREAM_STAGES).filter(s => s.name !== "complete").map((stage) => {
           const status = stageProgress[stage.name] || "pending";
@@ -1055,28 +1087,27 @@ function App() {
         })}
       </div>
 
-      {/* Partial Results Preview */}
-      {(result?.summary || result?.pros || result?.cons) && (
+      {hasPartialContent && (
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
             Partial Results (more coming...)
           </h3>
           
-          {result?.summary && (
+          {result?.summary && result.summary.length > 0 && (
             <div className="rounded-xl border border-white/10 bg-slate-950/35 p-4">
               <p className="text-xs uppercase tracking-wider text-emerald-200/80 mb-2">Summary</p>
               <p className="text-sm text-slate-100">{result.summary}</p>
             </div>
           )}
           
-          {result?.pros && result.pros.length > 0 && (
+          {result?.pros?.length > 0 && (
             <div className="rounded-xl border border-emerald-300/15 bg-emerald-300/8 p-4">
               <p className="text-xs uppercase tracking-wider text-emerald-100 mb-2">Pros (preliminary)</p>
               {renderList(result.pros.slice(0, 2), "Loading...")}
             </div>
           )}
           
-          {result?.cons && result.cons.length > 0 && (
+          {result?.cons?.length > 0 && (
             <div className="rounded-xl border border-rose-300/15 bg-rose-300/8 p-4">
               <p className="text-xs uppercase tracking-wider text-rose-100 mb-2">Cons (preliminary)</p>
               {renderList(result.cons.slice(0, 2), "Loading...")}
@@ -1134,29 +1165,10 @@ function App() {
               <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
                 <label className="block">
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-3 text-sm font-medium text-slate-200">
-                    <span>Enter Reviews</span>
-                    <div className="flex items-center gap-3">
-                      {reviewStats.total > 0 && (
-                        <div className="flex items-center gap-2">
-                          <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-xs text-emerald-300">
-                            ✓ {reviewStats.valid}
-                          </span>
-                          {reviewStats.invalid > 0 && (
-                            <span className="rounded-full border border-rose-400/30 bg-rose-400/10 px-2 py-0.5 text-xs text-rose-300">
-                              ✗ {reviewStats.invalid}
-                            </span>
-                          )}
-                        </div>
-                      )}
-                      <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
-                        {reviews.length} entry{reviews.length === 1 ? "" : "s"}
-                      </span>
-                      {isTruncated && (
-                        <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-xs text-amber-300">
-                          Limited to {MAX_REVIEWS_LIMIT}
-                        </span>
-                      )}
-                    </div>
+                    <span>Enter Reviews or Text</span>
+                    <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
+                      {reviews.length} entry{reviews.length === 1 ? "" : "s"}
+                    </span>
                   </div>
 
                   <div className="relative">
@@ -1168,44 +1180,17 @@ function App() {
                       disabled={loading}
                       rows={6}
                     />
-                    
-                    {reviewLines.length > 0 && reviewLines.some(r => r.status !== "skipped") && (
-                      <div className="mt-2 flex flex-wrap gap-1">
-                        {reviewLines.map((review, idx) => (
-                          <span 
-                            key={idx}
-                            className={`text-xs px-2 py-0.5 rounded-full ${
-                              review.status === "valid" 
-                                ? "bg-emerald-400/20 text-emerald-300" 
-                                : review.status === "invalid"
-                                ? "bg-rose-400/20 text-rose-300"
-                                : "bg-slate-400/10 text-slate-500"
-                            }`}
-                            title={review.trimmed || "(empty)"}
-                          >
-                            {idx + 1}
-                          </span>
-                        ))}
-                      </div>
-                    )}
                   </div>
                   
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
                     <span>
-                      Separate reviews with newlines. Each review must be at least 10 characters with letters.
+                      Separate reviews with newlines. AI will analyze everything.
                     </span>
                     <span className="text-slate-500">
                       {inputText.length}/{MAX_INPUT_LENGTH}
                     </span>
                   </div>
                 </label>
-
-                {isTruncated && (
-                  <div className="flex items-center gap-2 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-2 text-sm text-amber-100">
-                    <span>⚠️</span>
-                    <span>Only first {MAX_REVIEWS_LIMIT} of {reviews.length} reviews will be analyzed.</span>
-                  </div>
-                )}
 
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex flex-col gap-1">
@@ -1216,7 +1201,7 @@ function App() {
                       <div className="text-xs text-amber-300 animate-pulse">⏳ Cooldown active...</div>
                     )}
                     {serverStatus === "offline" && !error && (
-                      <div className="text-xs text-rose-300">🔴 Server is offline.</div>
+                      <div className="text-xs text-rose-300">🔴 Server is offline. Please wait or refresh.</div>
                     )}
                     {retryInfo?.status === "retried" && !error && (
                       <div className="text-xs text-emerald-400 animate-pulse">
@@ -1232,6 +1217,9 @@ function App() {
                       <div className="text-xs text-cyan-300 animate-pulse">
                         ⚡ Completed in {analysisStats.duration}ms
                       </div>
+                    )}
+                    {usingCachedResult && (
+                      <div className="text-xs text-amber-400">📦 Using cached result</div>
                     )}
                   </div>
 
@@ -1274,19 +1262,9 @@ function App() {
                 </div>
               </form>
 
-              {isInputTooShort && !error && !lowQualityMessage && (
-                <div className="mt-5 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
-                  {LOW_QUALITY_MESSAGE}
-                </div>
-              )}
               {error && (
                 <div className="mt-5 rounded-2xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
                   {error}
-                </div>
-              )}
-              {lowQualityMessage && (
-                <div className="mt-5 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
-                  {lowQualityMessage}
                 </div>
               )}
             </div>
@@ -1305,10 +1283,7 @@ function App() {
           </div>
         </section>
 
-        {/* ✅ STREAMING: Show streaming progress when active */}
         {loading && isStreaming && renderStreamingProgress()}
-        
-        {/* Regular skeleton for non-streaming */}
         {loading && !isStreaming && renderSkeleton()}
 
         {!result && !loading && (
@@ -1321,15 +1296,15 @@ function App() {
           </div>
         )}
 
-        {result && hasMeaningfulResult && !isInputTooShort && !lowQualityMessage && !loading && (
+        {result && hasMeaningfulResult && !loading && (
           <section id="result-section" className="rounded-[2rem] border border-white/10 bg-[rgba(7,23,19,0.72)] p-4 sm:p-6 lg:p-8">
             <div className="mb-6 sm:mb-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="text-xl sm:text-2xl font-semibold text-white">Analysis Result</h2>
                 <p className="mt-1 text-sm text-slate-300">
-                  Response from the FastAPI backend.
+                  AI-powered analysis complete.
                   {usingCachedResult && (
-                    <span className="ml-2 text-xs text-amber-400">(using previous result)</span>
+                    <span className="ml-2 text-xs text-amber-400">(cached result)</span>
                   )}
                 </p>
                 
@@ -1340,7 +1315,7 @@ function App() {
                       {analysisStats.streaming && <span className="text-emerald-400">[Streaming]</span>}
                     </span>
                     <span>•</span>
-                    <span>{analysisStats.reviewsAnalyzed} reviews</span>
+                    <span>{analysisStats.reviewsAnalyzed} entries</span>
                     {analysisStats.retriesUsed > 0 && (
                       <>
                         <span>•</span>
@@ -1376,7 +1351,7 @@ function App() {
 
             <div className="mb-6 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
               <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
-                <span className="block text-slate-400 text-xs">Reviews</span>
+                <span className="block text-slate-400 text-xs">Entries</span>
                 <span className="font-semibold text-slate-100">{safeResult.sentiment.total || reviews.length}</span>
               </div>
               <div className="rounded-xl sm:rounded-2xl border border-white/10 bg-black/10 px-3 sm:px-4 py-2 sm:py-3 text-xs sm:text-sm">
@@ -1424,20 +1399,19 @@ function App() {
                   {renderList(safeResult.neutral_points, "No neutral feedback found.")}
                 </article>
 
-                {safeResult.feature_scores && safeResult.feature_scores.length > 0 && (
+                {/* ✅ FIX 8: Removed duplicate filter - already filtered in normalizeResult */}
+                {safeResult.feature_scores?.length > 0 && (
                   <article className="rounded-xl sm:rounded-[1.5rem] border border-cyan-300/15 bg-cyan-300/8 p-4 sm:p-5">
                     <p className="text-xs sm:text-sm uppercase tracking-[0.18em] text-cyan-100">Feature Scores</p>
                     <div className="space-y-1">
-                      {safeResult.feature_scores
-                        .filter(isValidFeatureScore)
-                        .map((featureScore, index) => {
-                          const { feature, score } = extractFeatureScore(featureScore);
-                          return (
-                            <div key={`feature-${index}`}>
-                              {renderFeatureScore(feature, score)}
-                            </div>
-                          );
-                        })}
+                      {safeResult.feature_scores.map((featureScore, index) => {
+                        const { feature, score } = extractFeatureScore(featureScore);
+                        return (
+                          <div key={`feature-${index}`}>
+                            {renderFeatureScore(feature, score)}
+                          </div>
+                        );
+                      })}
                     </div>
                   </article>
                 )}

@@ -2270,7 +2270,16 @@ async def analyze_stream(
         
         yield "[DONE]\n"
     
-    return StreamingResponse(stream_results(), media_type="application/json")
+    return StreamingResponse(
+        stream_results(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+        }
+    )
+    
 
 
 # ==============================================================================
@@ -2421,6 +2430,9 @@ async def startup_event():
     _build_sentiment_automaton()
     logger.info("API v25.0-ai-validated started with STRICTER OUT-OF-SCOPE DETECTION (fixes applied)")
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
 
 @app.on_event("shutdown")
 async def shutdown_event():
